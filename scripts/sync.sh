@@ -3,7 +3,7 @@
 # --- CONFIGURATION ---
 POD_IP="$1"
 POD_PORT="$2"
-LOCAL_DIR=~/gpu/gemm/
+LOCAL_DIR="./"
 REMOTE_DIR="root@${POD_IP}:/root/gemm/"
 KEY_PATH="~/.ssh/id_ed25519"
 # ---------------------

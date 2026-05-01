@@ -1,21 +1,10 @@
-import time
-from triton.testing import do_bench
 import torch
 import cutlass
 import cutlass.cute as cute
 
-from gemm import GemmSm90
-
-def _bench_and_report(name, fn, flops, warmup=5, rep=30, gbps_bytes=0):
-    time.sleep(0.5)
-    t = do_bench(fn, warmup=warmup, rep=rep)
-    tflops = flops / (t * 1e9)
-    if gbps_bytes:
-        gbps = gbps_bytes / (t * 1e6)
-        print(f"{name}: {t:.3f} ms,  {tflops:7.1f} TFLOP/s,  {gbps:.0f} GB/s")
-    else:
-        print(f"{name}: {t:.3f} ms,  {tflops:7.1f} TFLOP/s")
-    return t
+from benchmark import bench_and_report
+from gemm_v1 import GemmSm90_v1
+from gemm_v2 import GemmSm90_v2
 
 
 @torch.library.custom_op("jonah::gemm_fn", mutates_args={"out"})
@@ -37,7 +26,7 @@ def _gemm_fn(
             cutlass.BFloat16, (m, n), stride_order=(1, 0), assumed_align=128
         )
         fn = cute.compile(
-            GemmSm90(),
+            GemmSm90_v1(),
             a_fake, b_fake, out_fake,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
@@ -70,17 +59,17 @@ B = torch.randn((N, K), device='cuda', dtype=torch.bfloat16)
 out = gemm_fn(A, B)
 
 ref = A @ B.T
-assert torch.allclose(out, ref, rtol=5e-2, atol=4.0)
+assert torch.allclose(out, ref, rtol=5e-2, atol=2.0)
 
 
 flops = 2 * M * N * K
 bytes_total = (M * K + N * K + M * N) * 2  # bf16 = 2 bytes
 
 def fn_custom():
-    _gemm_fn(A, B, out)
-t_custom = _bench_and_report("custom", fn_custom, flops, gbps_bytes=bytes_total)
+    gemm_fn(A, B)
+t_custom = bench_and_report("custom", fn_custom, flops, gbps_bytes=bytes_total)
 # Benchmark cuBLAS
 def fn_cublas():
     torch.mm(A, B.T)
-t_cublas = _bench_and_report("cuBLAS", fn_cublas, flops, gbps_bytes=bytes_total)
+t_cublas = bench_and_report("cuBLAS", fn_cublas, flops, gbps_bytes=bytes_total)
 print(f"\ncuBLAS speedup over custom: {t_custom / t_cublas:.2f}x")

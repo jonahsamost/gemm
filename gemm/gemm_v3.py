@@ -57,7 +57,6 @@ class GemmSm90_v3:
             atom_layout_n = 1
         assert atom_layout_m in [1, 2, 3] and atom_layout_n in [1, 2]
         self.atom_layout_mnk = (atom_layout_m, atom_layout_n, 1)
-        print(f'atom layout: {self.atom_layout_mnk}')
 
         self.threads_per_row = 8
         self.rows = self.threads_per_cta // 8
@@ -97,9 +96,8 @@ class GemmSm90_v3:
         gs_val_layout = cute.make_layout((1, 8), stride=(1, 1))
         tiled_copy = cute.make_tiled_copy_tv(atom_async, gs_thr_layout, gs_val_layout)
 
-        mrows = self.cta_tile_shape_mnk[0]
-        mcols = self.cta_tile_shape_mnk[1]
-
+        mrows = cute.ceil_div(A.shape[0], self.cta_tile_shape_mnk[0])
+        mcols = cute.ceil_div(B.shape[0], self.cta_tile_shape_mnk[1])
 
         self.kernel(
             A, B, out,
@@ -159,7 +157,6 @@ class GemmSm90_v3:
             tiled_mma, sD, self.epi_tile, tidx,
         )
         tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s)
-        print(f'trs_racc: {tRS_rAcc}')
 
         # grab first k tile and place it into first smem stage buffer
         ping = 0
@@ -192,7 +189,6 @@ class GemmSm90_v3:
 
         tcols = const_expr(self.epi_tile[1] // 8)
         trows = self.threads_per_cta // tcols
-        print(f'trows, tcols: {trows}, {tcols}')
         sg_thr_layout = cute.make_layout((trows, tcols), stride=(tcols,1))
         sg_val_layout = cute.make_layout((1, 8), stride=(1, 1))
         tiled_copy_s2g = cute.make_tiled_copy_tv(atom_sync, sg_thr_layout, sg_val_layout)
@@ -206,13 +202,6 @@ class GemmSm90_v3:
         epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(1,0))
         episize = cute.size(epi_tile_shape)
 
-        print(f'rd: {tRS_rD}')
-        print(f'sd: {tRS_sD}')
-        print(f'gOut div: {gOut_div}')
-        print(f'epi tile: {self.epi_tile}')
-        print(f'epi tile shape: {self.epi_tile_shape}')
-        print(f'mnk: {self.cta_tile_shape_mnk}')
-
         for s in cutlass.range_constexpr(episize):
             epi_coord = epi_tile_layout.get_hier_coord(s)
             # cute.autovec_copy(tRS_rAcc[None, None, None, epi_coord], tRS_rD)
@@ -221,7 +210,6 @@ class GemmSm90_v3:
             cute.copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, 0])
             cute.arch.sync_threads()
             gOut_subtile = cute.local_tile(gOut, self.epi_tile, epi_coord)
-            print(f'gout subtile: {gOut_subtile}')
             s2g_dst = thr_s2g.partition_D(gOut_subtile)
             cute.copy(tiled_copy_s2g, s2g_src, s2g_dst)
             cute.arch.sync_threads()

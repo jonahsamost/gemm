@@ -19,9 +19,6 @@ class GemmSm90_v3:
         tile_shape_mnk: Tuple[int, int] | Tuple[int, int, int] = (64, 128),
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
     ):
-        self.warpgroups = 1
-        self.threads_per_cta = self.warpgroups * 128
-
         self.acc_dtype = acc_dtype
         self.cta_tile_shape_mnk = (
             tuple(tile_shape_mnk) if len(tile_shape_mnk) == 3 else (*tile_shape_mnk, 0)
@@ -58,8 +55,14 @@ class GemmSm90_v3:
         assert atom_layout_m in [1, 2, 3] and atom_layout_n in [1, 2]
         self.atom_layout_mnk = (atom_layout_m, atom_layout_n, 1)
 
+        self.warpgroups = math.prod(self.atom_layout_mnk)
+        self.threads_per_wg = 128
+        self.threads_per_cta = self.warpgroups * self.threads_per_wg
+
+        print(f'atom layout mnk: {self.atom_layout_mnk}')
+
         self.threads_per_row = 8
-        self.rows = self.threads_per_cta // 8
+        self.rows = self.threads_per_cta // self.threads_per_row
 
     
     @cute.jit
@@ -141,6 +144,7 @@ class GemmSm90_v3:
         gA = cute.local_tile(A, tile_mk, (bidx, None))  # grab full stripe
         gB = cute.local_tile(B, tile_nk, (bidy, None))
         thr_copy = tiled_copy.get_slice(tidx)
+
         # partition gmem to smem
         gA_src = thr_copy.partition_S(gA)
         gB_src = thr_copy.partition_S(gB)
@@ -165,6 +169,12 @@ class GemmSm90_v3:
 
         kiters = cute.ceil_div(A.shape[1], self.cta_tile_shape_mnk[2])
         last_iter = kiters - 1
+
+        print(f'sA: {sA}')
+        print(f'tCrA: {tCrA}')
+        print(f'gA_src: {gA_src}')
+        print(f'gA_dst: {gA_dst}')
+
         for k in range(kiters):
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
@@ -186,11 +196,11 @@ class GemmSm90_v3:
             warpgroup.wait_group(0)
             ping ^= 1
 
-
         tcols = const_expr(self.epi_tile[1] // 8)
-        trows = self.threads_per_cta // tcols
+        trows = const_expr(self.threads_per_cta // tcols)
         sg_thr_layout = cute.make_layout((trows, tcols), stride=(tcols,1))
         sg_val_layout = cute.make_layout((1, 8), stride=(1, 1))
+
         tiled_copy_s2g = cute.make_tiled_copy_tv(atom_sync, sg_thr_layout, sg_val_layout)
         thr_s2g = tiled_copy_s2g.get_slice(tidx)
         gOut = cute.local_tile(out, tile_mn, (bidx, bidy))
@@ -223,6 +233,8 @@ class GemmSm90_v3:
         self.epi_tile_shape = cute.ceil_div(
             self.cta_tile_shape_mnk[:2], self.epi_tile
         )
+        # print(f'epi-tile: {self.epi_tile}')
+        # print(f'epi tile shape: {self.epi_tile_shape}')
     
     def _setup_smem_layout(self):
         # smem_capacity = cutlass.utils.get_smem_capacity_in_bytes(f"sm_0")  # smem_capacity
@@ -278,7 +290,6 @@ class GemmSm90_v3:
     
     def _setup_tiled_mma(self):
         tiler_mn = (64, self.cta_tile_shape_mnk[1] // self.atom_layout_mnk[1])
-        print(f'tiler_mn: {tiler_mn}')
         tiled_mma = sm90_helpers.make_trivial_tiled_mma(
             self.a_dtype, self.b_dtype,
             self.a_layout.sm90_mma_major_mode(),

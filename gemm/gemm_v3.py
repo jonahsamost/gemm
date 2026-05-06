@@ -59,8 +59,6 @@ class GemmSm90_v3:
         self.threads_per_wg = 128
         self.threads_per_cta = self.warpgroups * self.threads_per_wg
 
-        print(f'atom layout mnk: {self.atom_layout_mnk}')
-
         self.threads_per_row = 8
         self.rows = self.threads_per_cta // self.threads_per_row
 
@@ -170,11 +168,6 @@ class GemmSm90_v3:
         kiters = cute.ceil_div(A.shape[1], self.cta_tile_shape_mnk[2])
         last_iter = kiters - 1
 
-        print(f'sA: {sA}')
-        print(f'tCrA: {tCrA}')
-        print(f'gA_src: {gA_src}')
-        print(f'gA_dst: {gA_dst}')
-
         for k in range(kiters):
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
@@ -233,8 +226,6 @@ class GemmSm90_v3:
         self.epi_tile_shape = cute.ceil_div(
             self.cta_tile_shape_mnk[:2], self.epi_tile
         )
-        # print(f'epi-tile: {self.epi_tile}')
-        # print(f'epi tile shape: {self.epi_tile_shape}')
     
     def _setup_smem_layout(self):
         # smem_capacity = cutlass.utils.get_smem_capacity_in_bytes(f"sm_0")  # smem_capacity
@@ -390,12 +381,10 @@ class GemmSm90_v3:
             *cute.ceil_div(acc_reshaped.shape[1:], self.epi_tile_shape)
         )
         acc_divide = cute.flat_divide(acc_reshaped, epi_acc_shape)
-        print(f'acc_divide: {acc_divide}')
         assert cute.size(acc_divide, mode=[3]) == 1
         tRS_rAcc = cute.group_modes(
             acc_divide[None, None, None, 0, None, None], 3, 5
         )
-        print(f'trs_racc: {tRS_rAcc}')
         return tiled_copy_r2s.retile(tRS_rAcc)
     
     def epilog_smem_store_and_partition(

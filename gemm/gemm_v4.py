@@ -1,9 +1,8 @@
 import math
 from typing import Type, Tuple, Optional
-from smem_utils import make_smem_layout, make_epi_smem_layout
 import torch
 import cutlass
-from cutlass.cute.nvgpu import warpgroup
+from cutlass.cute.nvgpu import warpgroup, cpasync
 from cutlass import const_expr
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
@@ -11,6 +10,10 @@ from cutlass._mlir.dialects.cute import ReductionOp
 import cutlass.utils.hopper_helpers as sm90_helpers
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu.warp import StMatrix8x8x16bOp
+import cutlass.pipeline as pipeline
+
+from smem_utils import make_smem_layout, make_epi_smem_layout
+from utils import make_pipeline_state, tma_get_copy_fn
 
 '''
 adding TMA
@@ -64,6 +67,7 @@ class GemmSm90_v4:
 
         self.threads_per_row = 8
         self.rows = self.threads_per_cta // self.threads_per_row
+        self.ab_stage = 2 # simple double buffering for now
 
     
     @cute.jit
@@ -81,11 +85,6 @@ class GemmSm90_v4:
         self.d_dtype = out._dtype
         self.d_layout = LayoutEnum.from_tensor(out)
 
-        atom_async = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(),
-            cutlass.BFloat16,
-            num_bits_per_copy=128
-        )
         atom_sync = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             cutlass.BFloat16,
@@ -95,18 +94,26 @@ class GemmSm90_v4:
         self._setup_attributes()
         a_smem_layout, b_smem_layout, d_smem_layout = self._setup_smem_layout()
         self._setup_shared_storage(a_smem_layout, b_smem_layout, d_smem_layout)
-        # load gmem -> smem layout
-        gs_thr_layout = cute.make_layout((self.rows, self.threads_per_row), stride=(self.threads_per_row, 1))
-        gs_val_layout = cute.make_layout((1, 8), stride=(1, 1))
-        tiled_copy = cute.make_tiled_copy_tv(atom_async, gs_thr_layout, gs_val_layout)
+
+        # TMA
+        a_smem_layout_one = cute.slice_(a_smem_layout, (None, None, 0))
+        b_smem_layout_one = cute.slice_(b_smem_layout, (None, None, 0))
+
+        a_tma_atom, a_tma_tensor, b_tma_atom, b_tma_tensor = self._make_tma_load_atoms_and_tensors(
+            A, B, a_smem_layout_one, b_smem_layout_one
+        )
+        self.num_tma_load_bytes = (
+            cute.size_in_bytes(self.a_dtype, a_smem_layout_one)
+            + cute.size_in_bytes(self.b_dtype, b_smem_layout_one)
+        )
 
         mrows = cute.ceil_div(A.shape[0], self.cta_tile_shape_mnk[0])
         mcols = cute.ceil_div(B.shape[0], self.cta_tile_shape_mnk[1])
 
         self.kernel(
-            A, B, out,
-            tiled_copy,
-            atom_async, atom_sync,
+            a_tma_atom, a_tma_tensor, b_tma_atom, b_tma_tensor,
+            out,
+            atom_sync,
             a_smem_layout, b_smem_layout, d_smem_layout,
             tiled_mma,
         ).launch(
@@ -118,11 +125,11 @@ class GemmSm90_v4:
     @cute.kernel
     def kernel(
         self,
+        tma_atom_a: cute.CopyAtom,
         A: cute.Tensor,
+        tma_atom_b: cute.CopyAtom,
         B: cute.Tensor,
         out: cute.Tensor,
-        tiled_copy: cute.TiledCopy,
-        atom_async: cute.CopyAtom,
         atom_sync: cute.CopyAtom,
         a_smem_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
@@ -131,6 +138,10 @@ class GemmSm90_v4:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, _ = cute.arch.block_idx()
+
+        # prefetch tma desc
+        cpasync.prefetch_descriptor(tma_atom_a)
+        cpasync.prefetch_descriptor(tma_atom_b)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -142,15 +153,10 @@ class GemmSm90_v4:
         tile_mk = cute.select(self.cta_tile_shape_mnk, [0, 2])
         tile_nk = cute.select(self.cta_tile_shape_mnk, [1, 2])
 
-        gA = cute.local_tile(A, tile_mk, (bidx, None))  # grab full stripe
-        gB = cute.local_tile(B, tile_nk, (bidy, None))
-        thr_copy = tiled_copy.get_slice(tidx)
-
-        # partition gmem to smem
-        gA_src = thr_copy.partition_S(gA)
-        gB_src = thr_copy.partition_S(gB)
-        gA_dst = thr_copy.partition_D(sA)
-        gB_dst = thr_copy.partition_D(sB)
+        cta_coord_a = (bidx, None)
+        cta_coord_b = (bidy, None)
+        gA = cute.local_tile(A, tile_mk, cta_coord_a)
+        gB = cute.local_tile(B, tile_nk, cta_coord_b)
 
         # partition smem for mma
         thr_mma = tiled_mma.get_slice(tidx)
@@ -165,24 +171,54 @@ class GemmSm90_v4:
 
         # grab first k tile and place it into first smem stage buffer
         ping = 0
-        cute.copy(atom_async, gA_src[None, None, None, 0], gA_dst[None, None, None, ping])
-        cute.copy(atom_async, gB_src[None, None, None, 0], gB_dst[None, None, None, ping])
+        tma_load_pipeline = self.make_tma_pipeline(
+            tiled_mma, ab_pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
+        )
+        tma_producer_state = make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.ab_stage
+        )
+        tma_consumer_state = make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.ab_stage
+        )
+        tmaCopyA, _, _ = tma_get_copy_fn(
+            tma_atom_a,
+            cta_coord=0,
+            cta_layout=cute.make_layout((1,)),
+            src_tensor=gA,
+            dst_tensor=sA,
+        )
+        tmaCopyB, _, _ = tma_get_copy_fn(
+            tma_atom_b,
+            cta_coord=0,
+            cta_layout=cute.make_layout((1,)),
+            src_tensor=gB,
+            dst_tensor=sB,
+        )
+
+        tma_load_pipeline.producer_acquire(tma_producer_state)
+        tma_bar_ptr = tma_load_pipeline.producer_get_barrier(tma_producer_state)
+        tmaCopyA(0, ping, tma_bar_ptr=tma_bar_ptr)
+        tmaCopyB(0, ping, tma_bar_ptr=tma_bar_ptr)
+        tma_load_pipeline.producer_commit(tma_producer_state)
+        tma_producer_state.advance()
 
         kiters = cute.ceil_div(A.shape[1], self.cta_tile_shape_mnk[2])
         last_iter = kiters - 1
 
         for k in range(kiters):
-            cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.sync_threads()
-
+            # tma barrier
             if k != last_iter:
                 pong = ping ^ 1
                 nk = k + 1
-                cute.copy(atom_async, gA_src[None, None, None, nk], gA_dst[None, None, None, pong])
-                cute.copy(atom_async, gB_src[None, None, None, nk], gB_dst[None, None, None, pong])
+                tma_load_pipeline.producer_acquire(tma_producer_state)
+                tma_bar_ptr = tma_load_pipeline.producer_get_barrier(tma_producer_state)
+                tmaCopyA(nk, pong, tma_bar_ptr=tma_bar_ptr)
+                tmaCopyB(nk, pong, tma_bar_ptr=tma_bar_ptr)
+                tma_load_pipeline.producer_commit(tma_producer_state)
+                tma_producer_state.advance()
             
-            warpgroup.fence()            
+            tma_load_pipeline.consumer_wait(tma_consumer_state)
+            warpgroup.fence()
             mma_atom = cute.make_mma_atom(tiled_mma.op)
             mma_atom.set(warpgroup.Field.ACCUMULATE, k != 0)
             for mma_k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
@@ -190,6 +226,8 @@ class GemmSm90_v4:
                 mma_atom.set(warpgroup.Field.ACCUMULATE, True)
             warpgroup.commit_group()
             warpgroup.wait_group(0)
+            tma_load_pipeline.consumer_release(tma_consumer_state)
+            tma_consumer_state.advance()
             ping ^= 1
 
         tcols = const_expr(self.epi_tile[1] // 8)
@@ -220,6 +258,47 @@ class GemmSm90_v4:
             cute.copy(tiled_copy_s2g, s2g_src, s2g_dst)
             cute.arch.sync_threads()
     
+    def make_tma_pipeline(
+        self,
+        tiled_mma: cute.TiledMma,
+        pipeline_mbar_ptr: cute.Pointer,
+    ):
+        prod_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, 1
+        )
+        cons_arrive_cnt = tiled_mma.size // cute.arch.WARP_SIZE
+        cons_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, cons_arrive_cnt
+        )
+        return pipeline.PipelineTmaAsync.create(
+            num_stages=self.ab_stage,
+            barrier_storage=pipeline_mbar_ptr,
+            producer_group=prod_group,
+            consumer_group=cons_group,
+            tx_count=self.num_tma_load_bytes,
+            defer_sync=True,
+        )
+    
+    def _make_tma_load_atoms_and_tensors(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        a_smem_layout: cute.ComposedLayout,
+        b_smem_layout: cute.ComposedLayout,
+    ):
+        op = cpasync.CopyBulkTensorTileG2SOp()
+        m, n, k = self.cta_tile_shape_mnk
+        a_tma_atom, a_tma_tensor = cpasync.make_tiled_tma_atom(
+            op, mA, a_smem_layout, (m, k)
+        )
+        b_tma_atom, b_tma_tensor = cpasync.make_tiled_tma_atom(
+            op, mB, b_smem_layout, (n, k)
+        )
+        return (
+            a_tma_atom, a_tma_tensor,
+            b_tma_atom, b_tma_tensor
+        )
+    
     def _setup_attributes(self):
         self.epi_tile = self.compute_tile_shape(
             self.cta_tile_shape_mnk,
@@ -239,13 +318,12 @@ class GemmSm90_v4:
         #     cute.size(a_shape) * self.a_dtype.width // 8 + cute.size(b_shape) * self.b_dtype.width // 8
         # )
         # ab_stage = smem_capacity // ab_bytes_per_stage
-        ab_stage = 2 # simple double buffering for now
         
         a_smem_layout = make_smem_layout(
-            self.a_dtype, self.a_layout, self.cta_tile_shape_mnk, dim=0, ab_stage=ab_stage
+            self.a_dtype, self.a_layout, self.cta_tile_shape_mnk, dim=0, ab_stage=self.ab_stage
         )
         b_smem_layout = make_smem_layout(
-            self.b_dtype, self.b_layout, self.cta_tile_shape_mnk, dim=1, ab_stage=ab_stage
+            self.b_dtype, self.b_layout, self.cta_tile_shape_mnk, dim=1, ab_stage=self.ab_stage
         )
         d_smem_layout = make_epi_smem_layout(
             self.d_dtype, self.d_layout, self.epi_tile, stage=1,
@@ -280,6 +358,7 @@ class GemmSm90_v4:
                 ],
                 1024,
             ]
+            ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
         self.shared_storage = SharedStorage
     
     def _setup_tiled_mma(self):

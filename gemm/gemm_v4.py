@@ -13,10 +13,10 @@ from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu.warp import StMatrix8x8x16bOp
 
 '''
-adding tensor cores
+adding TMA
 '''
 
-class GemmSm90_v3:
+class GemmSm90_v4:
     def __init__(
         self,
         tile_shape_mnk: Tuple[int, int] | Tuple[int, int, int] = (64, 128),

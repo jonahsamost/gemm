@@ -6,7 +6,8 @@ from correctness import check_correctness
 from benchmark import bench_and_report
 # from gemm_v1 import GemmSm90_v1
 # from gemm_v2 import GemmSm90_v2
-from gemm_v3 import GemmSm90_v3
+# from gemm_v3 import GemmSm90_v3
+from gemm_v4 import GemmSm90_v4 as GemmSm90
 
 
 @torch.library.custom_op("jonah::gemm_fn", mutates_args={"out"})
@@ -28,7 +29,7 @@ def _gemm_fn(
             cutlass.BFloat16, (m, n), stride_order=(1, 0), assumed_align=128
         )
         fn = cute.compile(
-            GemmSm90_v3(tile_shape_mnk=(128, 256)),
+            GemmSm90(tile_shape_mnk=(128, 256)),
             a_fake, b_fake, out_fake,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",

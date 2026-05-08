@@ -12,15 +12,14 @@ from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu.warp import StMatrix8x8x16bOp
 import cutlass.pipeline as pipeline
 
-from cta_swizzle import get_swizzle_block
 from smem_utils import make_smem_layout, make_epi_smem_layout
 from utils import make_pipeline_state, tma_get_copy_fn
 
 '''
-adding TMA without warp specialization
+adding TMA with warp specialization
 '''
 
-class GemmSm90_v4:
+class GemmSm90_v5:
     def __init__(
         self,
         tile_shape_mnk: Tuple[int, int] | Tuple[int, int, int] = (64, 128),
@@ -62,7 +61,6 @@ class GemmSm90_v4:
         assert atom_layout_m in [1, 2, 3] and atom_layout_n in [1, 2]
         self.atom_layout_mnk = (atom_layout_m, atom_layout_n, 1)
 
-        self.cta_swizzle_width = 8
         self.warpgroups = math.prod(self.atom_layout_mnk)
         self.threads_per_wg = 128
         self.threads_per_cta = self.warpgroups * self.threads_per_wg
@@ -141,8 +139,7 @@ class GemmSm90_v4:
         tiled_mma: cute.TiledMma,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        # bidx, bidy, _ = cute.arch.block_idx()
-        bidx, bidy = get_swizzle_block(self.cta_swizzle_width)
+        bidx, bidy, _ = cute.arch.block_idx()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # prefetch tma desc

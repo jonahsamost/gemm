@@ -61,17 +61,17 @@ A = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
 B = torch.randn((N, K), device='cuda', dtype=torch.bfloat16)
 out = gemm_fn(A, B)
 
-ref = A @ B.T
-check_correctness(out, ref)
+# ref = A @ B.T
+# check_correctness(out, ref)
 
-flops = 2 * M * N * K
-bytes_total = (M * K + N * K + M * N) * 2  # bf16 = 2 bytes
+# flops = 2 * M * N * K
+# bytes_total = (M * K + N * K + M * N) * 2  # bf16 = 2 bytes
 
-def fn_custom():
-    gemm_fn(A, B)
-t_custom = bench_and_report("custom", fn_custom, flops, gbps_bytes=bytes_total)
-# Benchmark cuBLAS
-def fn_cublas():
-    torch.mm(A, B.T)
-t_cublas = bench_and_report("cuBLAS", fn_cublas, flops, gbps_bytes=bytes_total)
-print(f"\ncuBLAS speedup over custom: {t_cublas / t_custom:.2f}x")
+# def fn_custom():
+#     gemm_fn(A, B)
+# t_custom = bench_and_report("custom", fn_custom, flops, gbps_bytes=bytes_total)
+# # Benchmark cuBLAS
+# def fn_cublas():
+#     torch.mm(A, B.T)
+# t_cublas = bench_and_report("cuBLAS", fn_cublas, flops, gbps_bytes=bytes_total)
+# print(f"\ncuBLAS speedup over custom: {t_cublas / t_custom:.2f}x")

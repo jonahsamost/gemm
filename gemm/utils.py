@@ -13,22 +13,27 @@ def tma_get_copy_fn(
     cta_layout: cute.Layout,
     src_tensor: cute.Tensor,
     dst_tensor: cute.Tensor,
+    g2s: bool = True,
     *,
     loc=None,
     ip=None,
     **kwargs,
 ) -> Callable:
-    smem_group_rank = const_expr(cute.rank(dst_tensor) - 1)
-    gmem_group_rank = const_expr(cute.rank(src_tensor) - 1)
-    dst, src = cpasync.tma_partition(
+    st, dt = (src_tensor, dst_tensor) if const_expr(g2s) else (dst_tensor, src_tensor)
+
+    smem_group_rank = const_expr(cute.rank(dt) - 1)
+    gmem_group_rank = const_expr(cute.rank(st) - 1)
+    s, g = cpasync.tma_partition(
         atom,
         cta_coord,
         cta_layout,
-        cute.group_modes(dst_tensor, 0, smem_group_rank), 
-        cute.group_modes(src_tensor, 0, gmem_group_rank), 
+        cute.group_modes(dt, 0, smem_group_rank), 
+        cute.group_modes(st, 0, gmem_group_rank), 
         loc=loc,
         ip=ip,
     )
+
+    src, dst = (g, s) if const_expr(g2s) else (s, g)
 
     @dsl_user_op
     def copy_tma(src_idx, dst_idx, *, loc=None, ip=None, **new_kwargs):

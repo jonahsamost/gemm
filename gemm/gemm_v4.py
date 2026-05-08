@@ -16,7 +16,7 @@ from smem_utils import make_smem_layout, make_epi_smem_layout
 from utils import make_pipeline_state, tma_get_copy_fn
 
 '''
-adding TMA
+adding TMA without warp specialization
 '''
 
 class GemmSm90_v4:
@@ -70,10 +70,10 @@ class GemmSm90_v4:
         self.rows = self.threads_per_cta // self.threads_per_row
         self.ab_stage = 2 # simple double buffering for now
 
-        # self.epi_barrier = pipeline.NamedBarrier(
-        #     barrier_id=1,
-        #     num_threads=self.num_epi_warps * cute.arch.WARP_SIZE
-        # )
+        self.epi_barrier = pipeline.NamedBarrier(
+            barrier_id=1,
+            num_threads=self.num_epi_warps * cute.arch.WARP_SIZE
+        )
 
     
     @cute.jit
@@ -103,10 +103,9 @@ class GemmSm90_v4:
         a_tma_atom, a_tma_tensor, b_tma_atom, b_tma_tensor = self._make_tma_load_atoms_and_tensors(
             A, B, a_smem_layout_one, b_smem_layout_one
         )
-        # d_tma_atom, d_tma_tensor = self._make_tma_epilogue_atoms_and_tensors(
-        #     out, d_smem_layout
-        # )
-        d_tma_atom, d_tma_tensor = None, None
+        d_tma_atom, d_tma_tensor = self._make_tma_epilogue_atoms_and_tensors(
+            out, d_smem_layout
+        )
 
         self.num_tma_load_bytes = (
             cute.size_in_bytes(self.a_dtype, a_smem_layout_one)
@@ -146,7 +145,7 @@ class GemmSm90_v4:
         # prefetch tma desc
         cpasync.prefetch_descriptor(tma_atom_a)
         cpasync.prefetch_descriptor(tma_atom_b)
-        # cpasync.prefetch_descriptor(tma_atom_d)
+        cpasync.prefetch_descriptor(tma_atom_d)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -162,8 +161,8 @@ class GemmSm90_v4:
         cta_coord_b = (bidy, None)
         gA = cute.local_tile(A, tile_mk, cta_coord_a)
         gB = cute.local_tile(B, tile_nk, cta_coord_b)
-        # gD = cute.local_tile(D, tile_mn, (bidx, bidy))
-        # gD_tma = cute.zipped_divide(gD, self.epi_tile)
+        gD = cute.local_tile(D, tile_mn, (bidx, bidy))
+        gD_tma = cute.zipped_divide(gD, self.epi_tile)
 
         # partition smem for mma
         thr_mma = tiled_mma.get_slice(tidx)
@@ -171,17 +170,17 @@ class GemmSm90_v4:
         tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA))
         tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
         acc.fill(0.0)
-        # tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
-        #     tiled_mma, sD, self.epi_tile, tidx,
-        # )
-        # tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s)
+        tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
+            tiled_mma, sD, self.epi_tile, tidx,
+        )
+        tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s)
 
         # grab first k tile and place it into first smem stage buffer
         ping = 0
         tma_load_pipeline = self.make_tma_pipeline(
             tiled_mma, pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
         )
-        # epi_store_pipeline = self.make_epi_store_pipeline()
+        epi_store_pipeline = self.make_epi_store_pipeline()
         tma_producer_state = make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.ab_stage
         )
@@ -202,14 +201,14 @@ class GemmSm90_v4:
             src_tensor=gB,
             dst_tensor=sB,
         )
-        # tmaCopyD, _, _ = tma_get_copy_fn(
-        #     tma_atom_d,
-        #     cta_coord=0,
-        #     cta_layout=cute.make_layout((1,)),
-        #     src_tensor=sD,
-        #     dst_tensor=gD_tma,
-        #     g2s=False,
-        # )
+        tmaCopyD, _, _ = tma_get_copy_fn(
+            tma_atom_d,
+            cta_coord=0,
+            cta_layout=cute.make_layout((1,)),
+            src_tensor=sD,
+            dst_tensor=gD_tma,
+            g2s=False,
+        )
 
         tma_load_pipeline.producer_acquire(tma_producer_state)
         tma_bar_ptr = tma_load_pipeline.producer_get_barrier(tma_producer_state)
@@ -246,31 +245,31 @@ class GemmSm90_v4:
             tma_consumer_state.advance()
             ping ^= 1
 
-        # epi_tile_shape = cute.zipped_divide(
-        #     cute.make_layout(self.cta_tile_shape_mnk[:2]), self.epi_tile
-        # ).shape[1] # outer
-        # epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(0, 1))
-        # episize = cute.size(epi_tile_shape)
-        # is_tma_warp = warp_idx == 0
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(self.cta_tile_shape_mnk[:2]), self.epi_tile
+        ).shape[1] # outer
+        epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(0, 1))
+        episize = cute.size(epi_tile_shape)
+        is_tma_warp = warp_idx == 0
 
-        # print(f'cta tile shape mnk: {self.cta_tile_shape_mnk}')
-        # print(f'epi tile: {self.epi_tile}')
-        # print(f'epi tile shape: {self.epi_tile_shape}')
+        print(f'cta tile shape mnk: {self.cta_tile_shape_mnk}')
+        print(f'epi tile: {self.epi_tile}')
+        print(f'epi tile shape: {self.epi_tile_shape}')
 
-        # for epi_idx in cutlass.range_constexpr(episize):
-        #     epi_buffer = epi_idx % self.epi_stage
-        #     epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
-        #     data = tRS_rAcc[None, None, None, epi_coord].load()
-        #     if is_tma_warp:
-        #         epi_store_pipeline.producer_acquire()
-        #     self.epi_barrier.arrive_and_wait()
-        #     tRS_rD.store(data.to(self.d_dtype))
-        #     cute.copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
-        #     cute.arch.fence_view_async_shared()
-        #     self.epi_barrier.arrive_and_wait()
-        #     if is_tma_warp:
-        #         tmaCopyD(epi_buffer, epi_coord)
-        #         epi_store_pipeline.producer_commit()
+        for epi_idx in cutlass.range_constexpr(episize):
+            epi_buffer = epi_idx % self.epi_stage
+            epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
+            data = tRS_rAcc[None, None, None, epi_coord].load()
+            if is_tma_warp:
+                epi_store_pipeline.producer_acquire()
+            self.epi_barrier.arrive_and_wait()
+            tRS_rD.store(data.to(self.d_dtype))
+            cute.copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+            cute.arch.fence_view_async_shared()
+            self.epi_barrier.arrive_and_wait()
+            if is_tma_warp:
+                tmaCopyD(epi_buffer, epi_coord)
+                epi_store_pipeline.producer_commit()
     
     def make_epi_store_pipeline(self):
         num_epi_threads = self.num_epi_warps * cute.arch.WARP_SIZE
@@ -287,12 +286,13 @@ class GemmSm90_v4:
         tiled_mma: cute.TiledMma,
         pipeline_mbar_ptr: cute.Pointer,
     ):
+        arrive_cnt = tiled_mma.size // cute.arch.WARP_SIZE
         prod_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, 1
+            pipeline.Agent.Thread,
+            arrive_cnt
         )
-        cons_arrive_cnt = tiled_mma.size // cute.arch.WARP_SIZE
         cons_group = pipeline.CooperativeGroup(
-            pipeline.Agent.Thread, cons_arrive_cnt
+            pipeline.Agent.Thread, arrive_cnt
         )
         return pipeline.PipelineTmaAsync.create(
             num_stages=self.ab_stage,
@@ -300,7 +300,7 @@ class GemmSm90_v4:
             producer_group=prod_group,
             consumer_group=cons_group,
             tx_count=self.num_tma_load_bytes,
-            defer_sync=True,
+            defer_sync=False,
         )
 
     def _make_tma_epilogue_atoms_and_tensors(

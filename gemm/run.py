@@ -7,7 +7,8 @@ from benchmark import bench_and_report
 # from gemm_v1 import GemmSm90_v1
 # from gemm_v2 import GemmSm90_v2
 # from gemm_v3 import GemmSm90_v3
-from gemm_v4 import GemmSm90_v4 as GemmSm90
+# from gemm_v4 import GemmSm90_v4 as GemmSm90
+from gemm_v5 import GemmSm90_v5 as GemmSm90
 
 
 @torch.library.custom_op("jonah::gemm_fn", mutates_args={"out"})

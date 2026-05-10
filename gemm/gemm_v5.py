@@ -252,19 +252,30 @@ class GemmSm90_v5:
             tma_consumer_state = make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.ab_stage
             )
-            for k in cutlass.range(kiters, unroll=1):
+            
+            k_pipe_mmas = 1
+            ab_release_state = tma_consumer_state.clone()
+            for k in cutlass.range(k_pipe_mmas):
                 tma_load_pipeline.consumer_wait(tma_consumer_state)
-                warpgroup.fence()
-                mma_atom = cute.make_mma_atom(tiled_mma.op)
-                mma_atom.set(warpgroup.Field.ACCUMULATE, k != 0)
-                idx = tma_consumer_state.index
-                for mma_k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
-                    cute.gemm(mma_atom, acc, tCrA[None, None, mma_k, idx], tCrB[None, None, mma_k, idx], acc)
-                    mma_atom.set(warpgroup.Field.ACCUMULATE, True)
-                warpgroup.commit_group()
-                warpgroup.wait_group(1)
-                tma_load_pipeline.consumer_release(tma_consumer_state)
+                self.gemm(
+                    tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
+                    wg_wait=1, zero_init=True
+                )
                 tma_consumer_state.advance()
+
+            for k in cutlass.range(k_pipe_mmas, kiters, unroll=1):
+                tma_load_pipeline.consumer_wait(tma_consumer_state)
+                self.gemm(
+                    tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
+                    wg_wait=1, zero_init=False
+                )
+                tma_load_pipeline.consumer_release(ab_release_state)
+                ab_release_state.advance()
+                tma_consumer_state.advance()
+            
+            for k in cutlass.range(k_pipe_mmas):
+                tma_load_pipeline.consumer_release(ab_release_state)
+                ab_release_state.advance()
 
             warpgroup.wait_group(0)
             epi_tile_shape = cute.zipped_divide(
@@ -288,6 +299,26 @@ class GemmSm90_v5:
                 if is_tma_warp:
                     tmaCopyD(epi_buffer, epi_coord)
                     epi_store_pipeline.producer_commit()
+    
+    @cute.jit
+    def gemm(
+        self,
+        tiled_mma: cute.TiledMma,
+        acc: cute.Tensor,
+        tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
+        state_idx: int,
+        wg_wait: cutlass.Constexpr[int] = 0,
+        zero_init: cutlass.Constexpr[bool] = False,
+    ):
+        warpgroup.fence()
+        mma_atom = cute.make_mma_atom(tiled_mma.op)
+        mma_atom.set(warpgroup.Field.ACCUMULATE, not zero_init)
+        for mma_k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+            cute.gemm(mma_atom, acc, tCrA[None, None, mma_k, state_idx], tCrB[None, None, mma_k, state_idx], acc)
+            mma_atom.set(warpgroup.Field.ACCUMULATE, True)
+        warpgroup.commit_group()
+        warpgroup.wait_group(wg_wait)
     
     def make_epi_store_pipeline(self):
         num_epi_threads = self.num_epi_warps * cute.arch.WARP_SIZE

@@ -1,5 +1,5 @@
 import math
-from typing import Type, Tuple, Optional
+from typing import Callable, Type, Tuple, Optional
 import torch
 import cutlass
 from cutlass.cute.nvgpu import warpgroup, cpasync
@@ -115,6 +115,7 @@ class GemmSm90_v6:
         self._setup_stages()
         a_smem_layout, b_smem_layout, d_smem_layout = self._setup_smem_layout()
         self._setup_shared_storage(a_smem_layout, b_smem_layout, d_smem_layout)
+        self.cluster_layout_mnk = cute.layout(self.cluster_shape_mnk)
 
         # TMA
         a_smem_layout_one = cute.slice_(a_smem_layout, (None, None, 0))
@@ -143,6 +144,8 @@ class GemmSm90_v6:
             d_tma_atom, d_tma_tensor,
             a_smem_layout, b_smem_layout, d_smem_layout,
             tiled_mma,
+            self.cluster_layout_mnk,
+            tile_sched_params, TileScheduler,
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
@@ -159,6 +162,9 @@ class GemmSm90_v6:
         b_smem_layout: cute.ComposedLayout,
         d_smem_layout: cute.ComposedLayout,
         tiled_mma: cute.TiledMma,
+        cluster_layout_mnk,
+        tile_sched_params,
+        TileSchdulerCls: cutlass.Constexpr[Callable],
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy = get_swizzle_block(self.cta_swizzle_width)
@@ -172,6 +178,12 @@ class GemmSm90_v6:
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+
+        sched_pipeline = self.make_sched_pipeline(
+            cluster_layout_mnk,
+            sched_pipeline_mbar_ptr=storage.sched_pipeline_array_ptr.data_ptr()
+        )
+        sched_data = storage.sched_data.get_tensor((4, self.sched_stage))
 
         tma_load_pipeline = self.make_tma_pipeline(
             tiled_mma, pipeline_mbar_ptr=storage.ab_pipeline_array_ptr.data_ptr(),
@@ -358,6 +370,13 @@ class GemmSm90_v6:
             tx_count=self.num_tma_load_bytes,
             defer_sync=True,
         )
+    
+    def make_sched_pipeline(
+        self,
+        cluster_layout_mnk: cute.Layout,
+        sched_pipeline_mbar_ptr: cute.Pointer,
+    ):
+        ...
 
     def _make_tma_epilogue_atoms_and_tensors(
         self, mD: cute.Tensor, epi_smem_layout: cute.ComposedLayout
@@ -414,6 +433,7 @@ class GemmSm90_v6:
         remaining_bytes = self.smem_capacity - overhead_bytes - epi_bytes
         ab_stage = remaining_bytes // ab_bytes_per_stage
         self.ab_stage = min(ab_stage, 7)
+        self.sched_stage = 1
     
     def _setup_smem_layout(self):
         a_smem_layout = make_smem_layout(
@@ -456,6 +476,9 @@ class GemmSm90_v6:
                 1024,
             ]
             ab_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.ab_stage * 2]
+            sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, self.sched_stage * 2]
+            sched_data: cute.struct.MemRange[cutlass.Int32, self.sched_stage * 4]
+
         self.shared_storage = SharedStorage
     
     def _setup_tiled_mma(self):

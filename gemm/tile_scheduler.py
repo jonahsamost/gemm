@@ -95,3 +95,13 @@ class TileScheduler:
             params.cluster_shape_mnk[2] * num_persistent_clusters,
         )
     
+    @staticmethod
+    @cute.jit
+    def create(
+        params: Params,
+        sched_smem: cute.Tensor,
+        scheduler_pipeline: cutlass.pipeline.PipelineAsync,
+        *, loc=None, ip=None,
+    ):
+        ...
+    

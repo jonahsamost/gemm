@@ -13,6 +13,7 @@ from cutlass.cute.nvgpu.warp import StMatrix8x8x16bOp
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from tile_scheduler import TileScheduler, TileSchedulerArgs, RasterOrder
 from cta_swizzle import get_swizzle_block
 from smem_utils import make_smem_layout, make_epi_smem_layout
 from utils import make_pipeline_state, tma_get_copy_fn
@@ -21,7 +22,7 @@ from utils import make_pipeline_state, tma_get_copy_fn
 adding TMA with warp specialization and deeper pipeline
 '''
 
-class GemmSm90_v5:
+class GemmSm90_v6:
     def __init__(
         self,
         tile_shape_mnk: Tuple[int, int] | Tuple[int, int, int] = (64, 128),
@@ -99,6 +100,7 @@ class GemmSm90_v5:
         A: cute.Tensor,
         B: cute.Tensor,
         D: cute.Tensor,
+        tile_count_semaphore: cute.Pointer,  # TODO wire into run.py
         stream: cuda.CUstream
     ):
         self.a_dtype = A._dtype
@@ -124,14 +126,16 @@ class GemmSm90_v5:
         d_tma_atom, d_tma_tensor = self._make_tma_epilogue_atoms_and_tensors(
             D, d_smem_layout
         )
-
         self.num_tma_load_bytes = (
             cute.size_in_bytes(self.a_dtype, a_smem_layout_one)
             + cute.size_in_bytes(self.b_dtype, b_smem_layout_one)
         )
 
-        mrows = cute.ceil_div(A.shape[0], self.cta_tile_shape_mnk[0])
-        mcols = cute.ceil_div(B.shape[0], self.cta_tile_shape_mnk[1])
+        tile_sched_args = self.get_sched_args(
+            A, B, D, tile_count_semaphore
+        )
+        tile_sched_params = TileScheduler.create_params(tile_sched_args)
+        grid = TileScheduler.get_grid_shape(tile_sched_params)
 
         self.kernel(
             a_tma_atom, a_tma_tensor,
@@ -140,7 +144,7 @@ class GemmSm90_v5:
             a_smem_layout, b_smem_layout, d_smem_layout,
             tiled_mma,
         ).launch(
-            grid=(mrows, mcols, 1),
+            grid=grid,
             block=(self.threads_per_cta, 1, 1),
             stream=stream,
         )
@@ -586,3 +590,25 @@ class GemmSm90_v5:
             self.d_dtype
         )
         return tiled_copy_r2s, tRS_rD, tRS_sD
+    
+    def get_sched_args(
+        self, 
+        A: cute.Tensor, B: cute.Tensor, D: cute.Tensor,
+        tile_cnt_semaphore: cute.Pointer,
+    ):
+        m, n = cute.size(A, mode=[0]), cute.size(B, mode=[0])
+        mnl_shape = (
+            cute.ceil_div(m, self.cta_tile_shape_mnk[0]),
+            cute.ceil_div(n, self.cta_tile_shape_mnk[1]),
+            1,
+        )
+        rest_m, rest_n = mnl_shape[0], mnl_shape[1]
+        sched_args = TileSchedulerArgs(
+            problem_shape_ntile_mnl=mnl_shape,
+            raster_order=RasterOrder.AlongM if rest_n < rest_m else RasterOrder.AlongN,
+            group_size=self.cta_swizzle_width,
+            cluster_shape_mnk=self.cluster_shape_mnk,
+            tile_count_semaphore=tile_cnt_semaphore,
+        )
+        return sched_args
+

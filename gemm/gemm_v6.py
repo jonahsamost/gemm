@@ -1,3 +1,4 @@
+from functools import partial
 import math
 from typing import Callable, Type, Tuple, Optional
 import torch
@@ -167,7 +168,6 @@ class GemmSm90_v6:
         TileSchdulerCls: cutlass.Constexpr[Callable],
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, bidy = get_swizzle_block(self.cta_swizzle_width)
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         # prefetch tma desc
@@ -193,6 +193,10 @@ class GemmSm90_v6:
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
         sD = storage.sD.get_tensor(d_smem_layout.outer, swizzle=d_smem_layout.inner)
 
+        TileSchedCls = partial(
+            TileSchdulerCls.create, tile_sched_params, sched_data, sched_pipeline
+        )
+
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mnk[:-1])
 
         tile_mn = cute.select(self.cta_tile_shape_mnk, [0, 1])
@@ -205,38 +209,49 @@ class GemmSm90_v6:
         if warp_idx >= self.ab_load_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_load)
             if warp_idx < self.ab_load_warp_id + self.num_ab_load_warps:
-                cta_coord_a = (bidx, None)
-                cta_coord_b = (bidy, None)
-
-                gA = cute.local_tile(A, tile_mk, cta_coord_a)
-                gB = cute.local_tile(B, tile_nk, cta_coord_b)
+                is_scheduler_warp = self.num_ab_load_warps == 1 or warp_idx == self.ab_load_warp_id
+                if const_expr(cute.size(cluster_layout_mnk) > 1):
+                    is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
+                tile_scheduler = TileSchedCls()
+                work_tile = tile_scheduler.initial_work_tile_info()
                 tma_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
-                tmaCopyA, _, _ = tma_get_copy_fn(
-                    tma_atom_a,
-                    cta_coord=0,
-                    cta_layout=cute.make_layout((1,)),
-                    src_tensor=gA,
-                    dst_tensor=sA,
-                )
-                tmaCopyB, _, _ = tma_get_copy_fn(
-                    tma_atom_b,
-                    cta_coord=0,
-                    cta_layout=cute.make_layout((1,)),
-                    src_tensor=gB,
-                    dst_tensor=sB,
-                )
-
-                for k in cutlass.range(kiters, unroll=1):
-                    tma_load_pipeline.producer_acquire(tma_producer_state)
-                    tma_bar_ptr = tma_load_pipeline.producer_get_barrier(tma_producer_state)
-                    smem_idx = tma_producer_state.index
-                    tmaCopyA(k, smem_idx, tma_bar_ptr=tma_bar_ptr)
-                    tmaCopyB(k, smem_idx, tma_bar_ptr=tma_bar_ptr)
-                    tma_load_pipeline.producer_commit(tma_producer_state)
-                    tma_producer_state.advance()
+                while work_tile.is_valid_tile:
+                    bidx, bidy, _, _ = work_tile.tile_idx
                 
+                    cta_coord_a = (bidx, None)
+                    cta_coord_b = (bidy, None)
+
+                    gA = cute.local_tile(A, tile_mk, cta_coord_a)
+                    gB = cute.local_tile(B, tile_nk, cta_coord_b)
+                    tmaCopyA, _, _ = tma_get_copy_fn(
+                        tma_atom_a,
+                        cta_coord=0,
+                        cta_layout=cute.make_layout((1,)),
+                        src_tensor=gA,
+                        dst_tensor=sA,
+                    )
+                    tmaCopyB, _, _ = tma_get_copy_fn(
+                        tma_atom_b,
+                        cta_coord=0,
+                        cta_layout=cute.make_layout((1,)),
+                        src_tensor=gB,
+                        dst_tensor=sB,
+                    )
+
+                    for k in cutlass.range(kiters, unroll=1):
+                        tma_load_pipeline.producer_acquire(tma_producer_state)
+                        tma_bar_ptr = tma_load_pipeline.producer_get_barrier(tma_producer_state)
+                        smem_idx = tma_producer_state.index
+                        tmaCopyA(k, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                        tmaCopyB(k, smem_idx, tma_bar_ptr=tma_bar_ptr)
+                        tma_load_pipeline.producer_commit(tma_producer_state)
+                        tma_producer_state.advance()
+                    
+                    tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
+                    work_tile = tile_scheduler.get_current_work()
+                    
                 # wait for last mbarrier consumer release
                 if warp_idx == self.ab_load_warp_id:
                     tma_load_pipeline.producer_tail(tma_producer_state)
@@ -376,7 +391,24 @@ class GemmSm90_v6:
         cluster_layout_mnk: cute.Layout,
         sched_pipeline_mbar_ptr: cute.Pointer,
     ):
-        ...
+        sched_pipeline_prod_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread
+        )
+        cluster_size = cute.size(cluster_layout_mnk)
+        consumer_arrive_cnt = (
+            self.mma_warpgroups * 4
+        ) * cluster_size
+        sched_pipeline_cons_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread, consumer_arrive_cnt
+        )
+        return pipeline.PipelineAsync.create(
+            barrier_storage=sched_pipeline_mbar_ptr,
+            num_stages=self.sched_stage,
+            producer_group=sched_pipeline_prod_group,
+            consumer_group=sched_pipeline_cons_group,
+            consumer_mask=None if const_expr(cluster_size == 1) else 0,
+            defer_sync=True,
+        )
 
     def _make_tma_epilogue_atoms_and_tensors(
         self, mD: cute.Tensor, epi_smem_layout: cute.ComposedLayout

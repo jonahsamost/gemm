@@ -1,7 +1,8 @@
 from typing import Callable
 import cutlass.cute as cute
 from cutlass import const_expr, Int32
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass._mlir.dialects import nvvm
+from cutlass.cutlass_dsl import dsl_user_op, T
 from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import PipelineState, PipelineUserType
 
@@ -71,3 +72,22 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
         return PipelineStateWAdvance(stages, Int32(0), Int32(0), Int32(0))
     else:
         assert False, "Error: invalid PipelineUserType specified for make_pipeline_state."
+
+
+@dsl_user_op
+def atomic_inc_i32(
+    a: int | Int32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
+):
+    from cutlass import CUDA_VERSION
+
+    # * NVVM call based on nvvm version
+    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+        # Old API: requires explicit result type as first positional argument
+        return nvvm.atomicrmw(
+            res=T.i32(), op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+        )
+    else:
+        # New API: infers result type automatically
+        return nvvm.atomicrmw(
+            op=nvvm.AtomicOpKind.INC, ptr=gmem_ptr.llvm_ptr, a=Int32(a).ir_value()
+        )

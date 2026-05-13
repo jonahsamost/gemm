@@ -20,7 +20,7 @@ from smem_utils import make_smem_layout, make_epi_smem_layout
 from utils import make_pipeline_state, tma_get_copy_fn
 
 '''
-adding TMA with warp specialization and deeper pipeline
+adding dynamic persistent kernel
 '''
 
 class GemmSm90_v6:

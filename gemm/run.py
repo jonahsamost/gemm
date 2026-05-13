@@ -63,9 +63,7 @@ def gemm_fn(
     return out
 
 
-M = 8192
-N = 8192
-K = 8192
+M, N, K = 8192, 8192, 8192
 A = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
 B = torch.randn((N, K), device='cuda', dtype=torch.bfloat16)
 out = gemm_fn(A, B)

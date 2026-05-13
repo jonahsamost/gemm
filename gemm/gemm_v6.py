@@ -94,6 +94,10 @@ class GemmSm90_v6:
         )
         self.cta_swizzle_width = 8
         self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes("sm_90")
+        cluster_size = 1
+        self.max_active_clusters = (
+            cutlass.utils.HardwareInfo(0).get_max_active_clusters(cluster_size=cluster_size)
+        )
     
     @cute.jit
     def __call__(
@@ -101,7 +105,7 @@ class GemmSm90_v6:
         A: cute.Tensor,
         B: cute.Tensor,
         D: cute.Tensor,
-        tile_count_semaphore: cute.Pointer,  # TODO wire into run.py
+        tile_count_semaphore: cute.Pointer,
         stream: cuda.CUstream
     ):
         self.a_dtype = A._dtype
@@ -116,7 +120,7 @@ class GemmSm90_v6:
         self._setup_stages()
         a_smem_layout, b_smem_layout, d_smem_layout = self._setup_smem_layout()
         self._setup_shared_storage(a_smem_layout, b_smem_layout, d_smem_layout)
-        self.cluster_layout_mnk = cute.layout(self.cluster_shape_mnk)
+        self.cluster_layout_mnk = cute.make_layout(self.cluster_shape_mnk)
 
         # TMA
         a_smem_layout_one = cute.slice_(a_smem_layout, (None, None, 0))
@@ -137,7 +141,7 @@ class GemmSm90_v6:
             A, B, D, tile_count_semaphore
         )
         tile_sched_params = TileScheduler.create_params(tile_sched_args)
-        grid = TileScheduler.get_grid_shape(tile_sched_params)
+        grid = TileScheduler.get_grid_shape(tile_sched_params, self.max_active_clusters)
 
         self.kernel(
             a_tma_atom, a_tma_tensor,
@@ -150,6 +154,7 @@ class GemmSm90_v6:
         ).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
+            cluster=(1,1,1),
             stream=stream,
         )
 
@@ -272,6 +277,10 @@ class GemmSm90_v6:
             )
             tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s)
 
+            tma_consumer_state = make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.ab_stage
+            )
+
             tile_scheduler = TileSchedCls()
             work_tile = tile_scheduler.initial_work_tile_info()
 
@@ -286,10 +295,6 @@ class GemmSm90_v6:
                     src_tensor=sD,
                     dst_tensor=gD_tma,
                     g2s=False,
-                )
-
-                tma_consumer_state = make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.ab_stage
                 )
                 
                 k_pipe_mmas = 1
@@ -408,7 +413,7 @@ class GemmSm90_v6:
         )
         cluster_size = cute.size(cluster_layout_mnk)
         consumer_arrive_cnt = (
-            self.mma_warpgroups * 4
+            self.mma_warpgroups * 4 + self.num_ab_load_warps
         ) * cluster_size
         sched_pipeline_cons_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt
@@ -669,10 +674,9 @@ class GemmSm90_v6:
             cute.ceil_div(n, self.cta_tile_shape_mnk[1]),
             1,
         )
-        rest_m, rest_n = mnl_shape[0], mnl_shape[1]
         sched_args = TileSchedulerArgs(
             problem_shape_ntile_mnl=mnl_shape,
-            raster_order=RasterOrder.AlongM if rest_n < rest_m else RasterOrder.AlongN,
+            raster_order=None,
             group_size=self.cta_swizzle_width,
             cluster_shape_mnk=self.cluster_shape_mnk,
             tile_count_semaphore=tile_cnt_semaphore,

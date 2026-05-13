@@ -1,6 +1,6 @@
 import cutlass
 import cutlass.cute as cute
-from cutelass.base_dsl.typing import Integer
+from cutlass.base_dsl.typing import Integer
 from cutlass.cutlass_dsl import dsl_user_op
 
 

@@ -1,8 +1,9 @@
 import torch
 import cutlass
 import cutlass.cute as cute
-from correctness import check_correctness
+from cutlass.cute.runtime import make_ptr
 
+from correctness import check_correctness
 from benchmark import bench_and_report
 # from gemm_v1 import GemmSm90_v1
 # from gemm_v2 import GemmSm90_v2
@@ -12,9 +13,12 @@ from benchmark import bench_and_report
 from gemm_v6 import GemmSm90_v6 as GemmSm90
 
 
-@torch.library.custom_op("jonah::gemm_fn", mutates_args={"out"})
+@torch.library.custom_op("jonah::gemm_fn", mutates_args={"out", "tile_count_semaphore"})
 def _gemm_fn(
-    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    tile_count_semaphore: torch.Tensor,
 ) -> None:
     compile_key = ()
     if compile_key not in _gemm_fn.compile_cache:
@@ -27,19 +31,21 @@ def _gemm_fn(
         b_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.BFloat16, (n, k), stride_order=(1, 0), assumed_align=128
         )
+        tile_count_sem_fake = make_ptr(cutlass.Int32, 0, cute.AddressSpace.gmem, assumed_align=4)
         out_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.BFloat16, (m, n), stride_order=(1, 0), assumed_align=128
         )
         fn = cute.compile(
             GemmSm90(tile_shape_mnk=(128, 256)),
             a_fake, b_fake, out_fake,
+            tile_count_sem_fake,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
         _gemm_fn.compile_cache[compile_key] = fn
     
     _gemm_fn.compile_cache[compile_key](
-        A, B, out
+        A, B, out, tile_count_semaphore.data_ptr()
     )
 
 
@@ -53,12 +59,12 @@ def gemm_fn(
     m = A.size(0)
     n = B.size(0)
     out = torch.empty((m, n), device=A.device, dtype=A.dtype)
-    _gemm_fn(A, B, out)
+    _gemm_fn(A, B, out, tile_cnt_semaphore)
     return out
 
 
-M = 4096
-N = 4096
+M = 8192
+N = 8192
 K = 8192
 A = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
 B = torch.randn((N, K), device='cuda', dtype=torch.bfloat16)

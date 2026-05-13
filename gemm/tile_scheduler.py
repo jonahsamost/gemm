@@ -1,8 +1,6 @@
-from ast import Tuple
 from dataclasses import dataclass
 from enum import IntEnum
-from ssl import ALERT_DESCRIPTION_ILLEGAL_PARAMETER
-from typing import Optional
+from typing import Optional, Tuple
 import cutlass.cute as cute
 import cutlass
 from cutlass import Int32, const_expr, Boolean
@@ -49,14 +47,19 @@ class TileScheduler:
             )
             ncluster_mnl = ncluster_mn + (1,)
             num_clusters_per_problem = cute.size(ncluster_mn)
+            raster_order = (
+                RasterOrder.AlongM
+                if ncluster_mn[0] > ncluster_mn[1]
+                else RasterOrder.AlongN
+            )
             ncluster_fast = (
                 ncluster_mn[0]
-                if args.raster_order == RasterOrder.AlongM
+                if raster_order == RasterOrder.AlongM
                 else ncluster_mn[1]
             )
             ncluster_slow = (
                 ncluster_mn[1]
-                if args.raster_order == RasterOrder.AlongM
+                if raster_order == RasterOrder.AlongM
                 else ncluster_mn[0]
             )
             group_size = min(args.group_size, ncluster_fast)
@@ -65,11 +68,11 @@ class TileScheduler:
             num_clusters_in_group = group_size * ncluster_slow
             return TileScheduler.Params(
                 ncluster_mnl,
-                args.raster_order,
+                raster_order,
                 FastDivmod(num_clusters_per_problem),
                 num_groups_regular,
                 FastDivmod(group_size),
-                FastDivmod(group_size_tail),
+                FastDivmod(group_size_tail if group_size_tail > 0 else 1),
                 FastDivmod(num_clusters_in_group),
                 args.tile_count_semaphore,
                 args.cluster_shape_mnk,
@@ -128,7 +131,7 @@ class TileScheduler:
         *, loc=None, ip=None,
     ):
         current_work_idx = cute.arch.cluster_idx()[2]
-        stages = const_expr(cute.size(sched_smem), mode=[1]) 
+        stages = const_expr(cute.size(sched_smem, mode=[1]))
         return TileScheduler(
             current_work_idx,
             Int32(0),
@@ -159,14 +162,15 @@ class TileScheduler:
             bidz_, cluster_id_in_problem = divmod(work_idx, params.num_clusters_per_problem_fdd)
             if const_expr(bidz is not None):
                 bidz_ = bidz
-                cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)
-                pid_m, pid_n = self._cluster_id_to_cta_id(
-                    cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
-                )
-                batch_idx = bidz_
+            cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)
+            pid_m, pid_n = self._cluster_id_to_cta_id(
+                cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
+            )
+            batch_idx = bidz_
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
 
+    @cute.jit
     def _swizzle_cta(
         self, cluster_id_in_problem: Int32, *, loc=None, ip=None
     ):
@@ -176,7 +180,7 @@ class TileScheduler:
         if group_id < params.num_groups_regular:
             cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_fdd)
         else:
-            cid_slow, cid_fast_in_group, divmod(id_in_group, params.group_size_tail_fdd)
+            cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_tail_fdd)
         if group_id % 2 == 1:
             ncluster_slow = (
                 params.problem_shape_ncluster_mnl[1]
@@ -198,8 +202,8 @@ class TileScheduler:
             bidx_in_cluster = (Int32(0), Int32(0))
         else:
             bidx_in_cluster = cute.arch.block_in_cluster_idx()
-        pid_m = cid_m * self.params.cluster_shape_mnk[0] * bidx_in_cluster[0]
-        pid_n = cid_n * self.params.cluster_shape_mnk[1] * bidx_in_cluster[1]
+        pid_m = cid_m * self.params.cluster_shape_mnk[0] + bidx_in_cluster[0]
+        pid_n = cid_n * self.params.cluster_shape_mnk[1] + bidx_in_cluster[1]
         return pid_m, pid_n
     
     def initial_work_tile_info(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
@@ -234,7 +238,7 @@ class TileScheduler:
         sched_data = [
             work_tile.tile_idx[0],
             work_tile.tile_idx[1],
-            work_tile.tile_idx[2],
+            work_tile.tile_idx[3],
             Int32(work_tile.is_valid_tile),
         ]
         lane_idx = cute.arch.lane_idx()
@@ -243,6 +247,7 @@ class TileScheduler:
             if const_expr(cute.size(params.cluster_shape_mnk) == 1):
                 for i in cutlass.range_constexpr(4):
                     self._sched_smem[i, pipeline_idx] = sched_data[i]
+                self._scheduler_pipeline.producer_commit(self._pipeline_state)
             else:
                 ...
     
@@ -280,3 +285,50 @@ class TileScheduler:
                 self._current_work_idx, block_zero_only=True, loc=loc, ip=ip
             )
             self.write_work_tile_to_smem(work_tile_info, loc=loc, ip=ip)
+
+    def producer_tail(self):
+        if const_expr(self._scheduler_pipeline is not None):
+            pipeline_state_producer = PipelineStateWAdvance(
+                self._pipeline_state.stages,
+                self._pipeline_state.count,
+                self._pipeline_state.index,
+                self._pipeline_state.phase ^ 1,
+            )
+            self._scheduler_pipeline.producer_tail(pipeline_state_producer)
+    
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [
+            self._current_work_idx,
+            self.num_tiles_executed,
+            self._current_batch_idx,
+            self._num_work_idx_before_cur_batch,
+            self._sched_smem,
+            self._scheduler_pipeline,
+            self._pipeline_state,
+            self.params,
+        ]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            [
+                self._current_work_idx,
+                self.num_tiles_executed,
+                self._current_batch_idx,
+                self._num_work_idx_before_cur_batch,
+                self._sched_smem,
+                self._scheduler_pipeline,
+                self._pipeline_state,
+                self.params,
+            ],
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return self.__class__(*(tuple(obj_list)), loc=self._loc)
+

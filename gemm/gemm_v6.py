@@ -255,20 +255,12 @@ class GemmSm90_v6:
                 # wait for last mbarrier consumer release
                 if warp_idx == self.ab_load_warp_id:
                     tma_load_pipeline.producer_tail(tma_producer_state)
+                if is_scheduler_warp:
+                    tile_scheduler.producer_tail()
         else:
             cute.arch.setmaxregister_increase(self.num_regs_mma)
-            gD = cute.local_tile(D, tile_mn, (bidx, bidy))
-            gD_tma = cute.zipped_divide(gD, self.epi_tile)
-            epi_store_pipeline = self.make_epi_store_pipeline()
-            tmaCopyD, _, _ = tma_get_copy_fn(
-                tma_atom_d,
-                cta_coord=0,
-                cta_layout=cute.make_layout((1,)),
-                src_tensor=sD,
-                dst_tensor=gD_tma,
-                g2s=False,
-            )
 
+            epi_store_pipeline = self.make_epi_store_pipeline()
             # partition smem for mma
             thr_mma = tiled_mma.get_slice(tidx)
             acc = cute.make_rmem_tensor(thr_mma.partition_shape_C(tile_mn), cutlass.Float32)
@@ -280,57 +272,77 @@ class GemmSm90_v6:
             )
             tRS_rAcc = self.epi_retile_acc(acc, tRS_rD, tiled_copy_r2s)
 
-            tma_consumer_state = make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.ab_stage
-            )
-            
-            k_pipe_mmas = 1
-            ab_release_state = tma_consumer_state.clone()
-            for k in cutlass.range(k_pipe_mmas):
-                tma_load_pipeline.consumer_wait(tma_consumer_state)
-                self.gemm(
-                    tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
-                    wg_wait=1, zero_init=True
+            tile_scheduler = TileSchedCls()
+            work_tile = tile_scheduler.initial_work_tile_info()
+
+            while work_tile.is_valid_tile:
+                bidx, bidy, _, _ = work_tile.tile_idx
+                gD = cute.local_tile(D, tile_mn, (bidx, bidy))
+                gD_tma = cute.zipped_divide(gD, self.epi_tile)
+                tmaCopyD, _, _ = tma_get_copy_fn(
+                    tma_atom_d,
+                    cta_coord=0,
+                    cta_layout=cute.make_layout((1,)),
+                    src_tensor=sD,
+                    dst_tensor=gD_tma,
+                    g2s=False,
                 )
-                tma_consumer_state.advance()
 
-            for k in cutlass.range(k_pipe_mmas, kiters, unroll=1):
-                tma_load_pipeline.consumer_wait(tma_consumer_state)
-                self.gemm(
-                    tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
-                    wg_wait=1, zero_init=False
+                tma_consumer_state = make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.ab_stage
                 )
-                tma_load_pipeline.consumer_release(ab_release_state)
-                ab_release_state.advance()
-                tma_consumer_state.advance()
-            
-            for k in cutlass.range(k_pipe_mmas):
-                tma_load_pipeline.consumer_release(ab_release_state)
-                ab_release_state.advance()
+                
+                k_pipe_mmas = 1
+                ab_release_state = tma_consumer_state.clone()
+                for k in cutlass.range(k_pipe_mmas):
+                    tma_load_pipeline.consumer_wait(tma_consumer_state)
+                    self.gemm(
+                        tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
+                        wg_wait=1, zero_init=True
+                    )
+                    tma_consumer_state.advance()
 
-            warpgroup.wait_group(0)
-            epi_tile_shape = cute.zipped_divide(
-                cute.make_layout(self.cta_tile_shape_mnk[:2]), self.epi_tile
-            ).shape[1] # outer
-            epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(0, 1))
-            episize = cute.size(epi_tile_shape)
-            is_tma_warp = warp_idx == 0
+                for k in cutlass.range(k_pipe_mmas, kiters, unroll=1):
+                    tma_load_pipeline.consumer_wait(tma_consumer_state)
+                    self.gemm(
+                        tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
+                        wg_wait=1, zero_init=False
+                    )
+                    tma_load_pipeline.consumer_release(ab_release_state)
+                    ab_release_state.advance()
+                    tma_consumer_state.advance()
+                
+                for k in cutlass.range(k_pipe_mmas):
+                    tma_load_pipeline.consumer_release(ab_release_state)
+                    ab_release_state.advance()
 
-            for epi_idx in cutlass.range_constexpr(episize):
-                epi_buffer = epi_idx % self.epi_stage
-                epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
-                data = tRS_rAcc[None, None, None, epi_coord].load()
-                if is_tma_warp:
-                    epi_store_pipeline.producer_acquire()
-                self.epi_barrier.arrive_and_wait()
-                tRS_rD.store(data.to(self.d_dtype))
-                # NOTE why does tiled_copy_r2s get used here?
-                cute.copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
-                cute.arch.fence_view_async_shared()
-                self.epi_barrier.arrive_and_wait()
-                if is_tma_warp:
-                    tmaCopyD(epi_buffer, epi_coord)
-                    epi_store_pipeline.producer_commit()
+                warpgroup.wait_group(0)
+                epi_tile_shape = cute.zipped_divide(
+                    cute.make_layout(self.cta_tile_shape_mnk[:2]), self.epi_tile
+                ).shape[1] # outer
+                epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(0, 1))
+                episize = cute.size(epi_tile_shape)
+                is_tma_warp = warp_idx == 0
+
+                for epi_idx in cutlass.range_constexpr(episize):
+                    epi_buffer = epi_idx % self.epi_stage
+                    epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
+                    data = tRS_rAcc[None, None, None, epi_coord].load()
+                    if is_tma_warp:
+                        epi_store_pipeline.producer_acquire()
+                    self.epi_barrier.arrive_and_wait()
+                    tRS_rD.store(data.to(self.d_dtype))
+                    # NOTE why does tiled_copy_r2s get used here?
+                    cute.copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
+                    cute.arch.fence_view_async_shared()
+                    self.epi_barrier.arrive_and_wait()
+                    if is_tma_warp:
+                        tmaCopyD(epi_buffer, epi_coord)
+                        epi_store_pipeline.producer_commit()
+
+                tile_scheduler.advance_to_next_work()
+                work_tile = tile_scheduler.get_current_work()
+
     
     @cute.jit
     def gemm(

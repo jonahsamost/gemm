@@ -220,6 +220,51 @@ class TileScheduler:
         return cute.arch.shuffle_sync(next_work_linear_idx, 0)
     
     @cute.jit
+    def write_work_tile_to_smem(
+        self, work_tile: cutlass.utils.WorkTileInfo, *, loc=None, ip=None
+    ):
+        params = self.params
+        pipeline_state_prod = PipelineStateWAdvance(
+            self._pipeline_state.stages,
+            self._pipeline_state.count,
+            self._pipeline_state.index,
+            self._pipeline_state.phase ^ 1,
+        )
+        self._scheduler_pipeline.producer_acquire(pipeline_state_prod)
+        sched_data = [
+            work_tile.tile_idx[0],
+            work_tile.tile_idx[1],
+            work_tile.tile_idx[2],
+            Int32(work_tile.is_valid_tile),
+        ]
+        lane_idx = cute.arch.lane_idx()
+        if lane_idx < cute.size(params.cluster_shape_mnk):
+            pipeline_idx = self._pipeline_state.index
+            if const_expr(cute.size(params.cluster_shape_mnk) == 1):
+                for i in cutlass.range_constexpr(4):
+                    self._sched_smem[i, pipeline_idx] = sched_data[i]
+            else:
+                ...
+    
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+        params = self.params
+        pid_m, pid_n, batch_idx, is_valid = Int32(0), Int32(0), Int32(0), Boolean(False)
+        self._scheduler_pipeline.consumer_wait(self._pipeline_state)
+        pid_m, pid_n, batch_idx, is_valid_i32 = [
+            self._sched_smem[i, self._pipeline_state.index] for i in range(4)
+        ]
+        if const_expr(cute.size(params.cluster_shape_mnk) > 1):
+            cute.arch.fence_view_async_shared()
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            self._scheduler_pipeline.consumer_release(self._pipeline_state)
+        self._pipeline_state.advance()
+        is_valid= Boolean(is_valid_i32)
+        tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
+        return cutlass.utils.WorkTileInfo(tile_coord_mnkl, Boolean(is_valid))
+    
+    @cute.jit
     def advance_to_next_work(
         self,
         is_scheduler_warp: bool | Boolean = False,

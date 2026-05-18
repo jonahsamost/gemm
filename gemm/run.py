@@ -10,7 +10,8 @@ from benchmark import bench_and_report
 # from gemm_v3 import GemmSm90_v3
 # from gemm_v4 import GemmSm90_v4 as GemmSm90
 # from gemm_v5 import GemmSm90_v5 as GemmSm90
-from gemm_v6 import GemmSm90_v6 as GemmSm90
+# from gemm_v6 import GemmSm90_v6 as GemmSm90
+from gemm_v7 import GemmSm90_v7 as GemmSm90
 
 
 @torch.library.custom_op("jonah::gemm_fn", mutates_args={"out", "tile_count_semaphore"})
@@ -36,7 +37,10 @@ def _gemm_fn(
             cutlass.BFloat16, (m, n), stride_order=(1, 0), assumed_align=128
         )
         fn = cute.compile(
-            GemmSm90(tile_shape_mnk=(128, 256)),
+            GemmSm90(
+                tile_shape_mnk=(128, 256),
+                cluster_shape_mnk=(2, 1, 1),
+            ),
             a_fake, b_fake, out_fake,
             tile_count_sem_fake,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),

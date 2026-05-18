@@ -7,7 +7,7 @@ from cutlass import Int32, const_expr, Boolean
 
 
 from divmod import FastDivmod
-from utils import PipelineStateWAdvance, atomic_inc_i32
+from utils import PipelineStateWAdvance, atomic_inc_i32, store_shared_remote_x4
 
 
 class RasterOrder(IntEnum):
@@ -249,7 +249,23 @@ class TileScheduler:
                     self._sched_smem[i, pipeline_idx] = sched_data[i]
                 self._scheduler_pipeline.producer_commit(self._pipeline_state)
             else:
-                ...
+                peer_cta_rank_in_cluster = lane_idx
+                bidx_in_cluster = peer_cta_rank_in_cluster % params.cluster_shape_mnk[0]
+                bidy_in_cluster = (
+                    peer_cta_rank_in_cluster // params.cluster_shape_mnk[0]
+                ) % params.cluster_shape_mnk[1]
+                mbar_ptr = self._scheduler_pipeline.producer_get_barrier(self._pipeline_state)
+                cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, 16, peer_cta_rank_in_cluster)
+                store_shared_remote_x4(
+                    sched_data[0] + bidx_in_cluster,
+                    sched_data[1] + bidy_in_cluster,
+                    sched_data[2],
+                    sched_data[3],
+                    smem_ptr=self._sched_smem[None, pipeline_idx].iterator,
+                    mbar_ptr=mbar_ptr,
+                    peer_cta_rank_in_cluster=peer_cta_rank_in_cluster,
+                )
+                
     
     @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:

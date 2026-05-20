@@ -4,7 +4,7 @@ from typing import Callable, Type, Tuple, Optional
 import torch
 import cutlass
 from cutlass.cute.nvgpu import warpgroup, cpasync
-from cutlass import const_expr
+from cutlass import const_expr, Boolean
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 from cutlass._mlir.dialects.cute import ReductionOp
@@ -20,7 +20,7 @@ from smem_utils import make_smem_layout, make_epi_smem_layout
 from utils import NamedBarrier, make_pipeline_state, tma_get_copy_fn
 
 '''
-adding ping-pong
+adding pingpong mma and epi warps and consumer and producer try/wait in mma and load warps
 '''
 
 class GemmSm90_v8:
@@ -287,15 +287,18 @@ class GemmSm90_v8:
                         dst_tensor=sB,
                         mcast_mask=b_mcast_mask,
                     )
-
+                    peek_status = tma_load_pipeline.producer_try_acquire(tma_producer_state)
                     for k in cutlass.range(kiters, unroll=1):
-                        tma_load_pipeline.producer_acquire(tma_producer_state)
+                        tma_load_pipeline.producer_acquire(tma_producer_state, peek_status)
                         tma_bar_ptr = tma_load_pipeline.producer_get_barrier(tma_producer_state)
                         smem_idx = tma_producer_state.index
                         tmaCopyA(k, smem_idx, tma_bar_ptr=tma_bar_ptr)
                         tmaCopyB(k, smem_idx, tma_bar_ptr=tma_bar_ptr)
                         tma_load_pipeline.producer_commit(tma_producer_state)
                         tma_producer_state.advance()
+                        peek_status = Boolean(True)
+                        if k + 1 < kiters:
+                            peek_status = tma_load_pipeline.producer_try_acquire(tma_producer_state)
                     
                     tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
                     work_tile = tile_scheduler.get_current_work()
@@ -370,16 +373,19 @@ class GemmSm90_v8:
                 # MMA
                 k_pipe_mmas = 1
                 ab_release_state = tma_consumer_state.clone()
+                peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
                 for k in cutlass.range(k_pipe_mmas):
-                    tma_load_pipeline.consumer_wait(tma_consumer_state)
+                    tma_load_pipeline.consumer_wait(tma_consumer_state, peek_load_status)
                     self.gemm(
                         tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
                         wg_wait=1, zero_init=True
                     )
                     tma_consumer_state.advance()
+                    if k + 1 < kiters:
+                        peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
 
                 for k in cutlass.range(k_pipe_mmas, kiters, unroll=1):
-                    tma_load_pipeline.consumer_wait(tma_consumer_state)
+                    tma_load_pipeline.consumer_wait(tma_consumer_state, peek_load_status)
                     self.gemm(
                         tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
                         wg_wait=1, zero_init=False
@@ -387,6 +393,9 @@ class GemmSm90_v8:
                     tma_load_pipeline.consumer_release(ab_release_state)
                     ab_release_state.advance()
                     tma_consumer_state.advance()
+                    peek_load_status = Boolean(True)
+                    if k + 1 < kiters:
+                        peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
 
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")

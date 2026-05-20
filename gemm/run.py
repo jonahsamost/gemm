@@ -11,7 +11,8 @@ from benchmark import bench_and_report
 # from gemm_v4 import GemmSm90_v4 as GemmSm90
 # from gemm_v5 import GemmSm90_v5 as GemmSm90
 # from gemm_v6 import GemmSm90_v6 as GemmSm90
-from gemm_v7 import GemmSm90_v7 as GemmSm90
+# from gemm_v7 import GemmSm90_v7 as GemmSm90
+from gemm_v8 import GemmSm90_v8 as GemmSm90
 
 
 @torch.library.custom_op("jonah::gemm_fn", mutates_args={"out", "tile_count_semaphore"})
@@ -38,8 +39,8 @@ def _gemm_fn(
         )
         fn = cute.compile(
             GemmSm90(
-                tile_shape_mnk=(128, 256),
-                cluster_shape_mnk=(2, 1, 1),
+                tile_shape_mnk=(128, 208),
+                cluster_shape_mnk=(1, 2, 1),
             ),
             a_fake, b_fake, out_fake,
             tile_count_sem_fake,
@@ -67,7 +68,7 @@ def gemm_fn(
     return out
 
 
-M, N, K = 8192, 8192, 8192
+M = N = K = 8192
 A = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
 B = torch.randn((N, K), device='cuda', dtype=torch.bfloat16)
 out = gemm_fn(A, B)

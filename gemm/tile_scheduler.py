@@ -295,6 +295,8 @@ class TileScheduler:
     ):
         params = self.params
         self.num_tiles_executed += Int32(advance_count)
+        if const_expr(self._pipeline_state is not None and advance_count > 1):
+            self._pipeline_state.advance_iters(advance_count - 1)
         if is_scheduler_warp:
             self._current_work_idx = self._fetch_next_work_idx(loc=loc, ip=ip)
             work_tile_info = self._delinearize_work_idx(

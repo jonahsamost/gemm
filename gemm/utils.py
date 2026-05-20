@@ -7,6 +7,16 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.pipeline import PipelineState, PipelineUserType
 
 
+class NamedBarrier:
+    Epilogue = 1
+    EpilogueLoad = 2
+    MmaWG0 = 3
+    MmaWG1 = 4
+    EpiWG0 = 5
+    EpiWG1 = 6
+    TmemPtr = 7
+
+
 @dsl_user_op
 def tma_get_copy_fn(
     atom: cute.CopyAtom,

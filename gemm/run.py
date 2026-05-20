@@ -40,7 +40,9 @@ def _gemm_fn(
         fn = cute.compile(
             GemmSm90(
                 tile_shape_mnk=(128, 208),
-                cluster_shape_mnk=(1, 2, 1),
+                cluster_shape_mnk=(2, 1, 1),
+                # tile_shape_mnk=(128, 256),
+                # cluster_shape_mnk=(2, 1, 1),
             ),
             a_fake, b_fake, out_fake,
             tile_count_sem_fake,

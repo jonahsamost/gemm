@@ -25,6 +25,7 @@ When we talk of swizzling, this data movement is what we're speaking about. The 
 Let's shrink our problem down a bit to an 8x8 chunk. We want some function that changes the literal address of where some data will be stored then accessed. We know we're really just trying to rearrange row data. And that each memory bank is 4 bytes wide (i.e. 32 bits). So, 8 elements wide * 4 bytes per element * 8 bits per byte == 256 contiguous bits wide.
 
 So, our rows's starting addresses in decimal, hex, and binary would be:
+```
 row 0:   0 0x00 0b00000000
 row 1:  32 0x20 0b00100000
 row 2:  64 0x40 0b01000000
@@ -33,8 +34,10 @@ row 4: 128 0x80 0b10000000
 row 5: 160 0xa0 0b10100000
 row 6: 192 0xc0 0b11000000
 row 7: 224 0xe0 0b11100000
+```
 
 Let's focus in on row 1 to try and see any patterns.
+```
 32 0x20 0b00100000
 36 0x24 0b00100100
 40 0x28 0b00101000
@@ -43,8 +46,10 @@ Let's focus in on row 1 to try and see any patterns.
 52 0x34 0b00110100
 56 0x38 0b00111000
 60 0x3c 0b00111100
+```
 
 Now row 2:
+```
 64 0x40 0b1000000
 68 0x44 0b1000100
 72 0x48 0b1001000
@@ -53,6 +58,7 @@ Now row 2:
 84 0x54 0b1010100
 88 0x58 0b1011000
 92 0x5c 0b1011100
+```
 
 The 2 least significant bits never change; this makes sense because were striding along 4 byte banks.
 Only bits 2-4 change. This makes sense, as 2^3 equals 8 which is the number of columns in our chunk. 
@@ -64,10 +70,10 @@ At base this function needs to be a bijection. This is a function where every in
 
 Addition might work. Addition would need an inverse (namely subtraction). If you were to add the row bits into the column bits on write, you would need to deal with carry bits. But this could be handled if on read (subtracting the columns from the row bits) you enounter a negative value. 
 
-The and operation wouldn't work. Consider, 0b01 & 0b10 == 0b01 & 0b00 == 0b00.
-The or operation also wouldn't work. Consider, 0b01 | 0b10 == 0b01 | 0b11 == 0b11.
+The and operation wouldn't work. Consider, `0b01 & 0b10 == 0b01 & 0b00 == 0b00`.
+The or operation also wouldn't work. Consider, `0b01 | 0b10 == 0b01 | 0b11 == 0b11`.
 
-XOR is interesting because its self inverting (i.e. a ^ b ^ b == a). It's also a single function unlike our add and subtract idea. It also doesn't have a carry problem. Furthermore, if we set a as our row and b as our column, then necessarily f(a, b) = a ^ b _must be_ different for the same b and different a. This is exactly to say that using xor as our transformation will bank-conflict-free data access.
+XOR is interesting because its self inverting (i.e. `a ^ b ^ b == a`). It's also a single function unlike our add and subtract idea. It also doesn't have a carry problem. Furthermore, if we set a as our row and b as our column, then necessarily `f(a, b) = a ^ b` _must be_ different for the same b and different a. This is exactly to say that using xor as our transformation will bank-conflict-free data access.
 
 Putting this all together, our funky function will be:
 On before write into SMEM, an xor function will get applied such that the data that was meant to be written to some address, will be written to the address with the transformation of `column bits = column bits ^ row bits` applied. Reading from SMEM is then simply reading from the address with that same transformation applied.

@@ -54,14 +54,14 @@ Let's focus in on row 1 to try and see any patterns.
 
 Now row 2:
 ```
-64 0x40 0b1000000
-68 0x44 0b1000100
-72 0x48 0b1001000
-76 0x4c 0b1001100
-80 0x50 0b1010000
-84 0x54 0b1010100
-88 0x58 0b1011000
-92 0x5c 0b1011100
+64 0x40 0b01000000
+68 0x44 0b01000100
+72 0x48 0b01001000
+76 0x4c 0b01001100
+80 0x50 0b01010000
+84 0x54 0b01010100
+88 0x58 0b01011000
+92 0x5c 0b01011100
 ```
 
 The 2 least significant bits never change; this makes sense because were striding along 4 byte banks.

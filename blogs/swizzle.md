@@ -1,10 +1,12 @@
 # Swizzling
 
-### The hardware history
+### Motivating the issue
+
+A lot of the blogs that I've read on swizzling don't motivate the problem in a way that I can understand. So my aim for this blog is to do just that. Let me know what you think.
 
 The [crossbar switch](https://web.eecs.umich.edu/~tnm/trev_test/papersPDF/2012.8.swizzleHotChips.pdf) is the physical bottleneck connecting processing cores to memory banks. The crossbar is the underlying technology, which handles data access routing, and explains why this problem looks the same regardless of whether you are looking at a [2000s CPU motherboard](https://archive.techarp.com/showFreeBOGc856.html?lang=0&bogno=438) or a modern Nvidia GPU. 
 
-![Swizzle switch](assets/swizzle_switch.png)
+![Swizzle switch](https://github.com/jonahsamost/gemm/blob/main/blogs/assets/swizzle_switch.png)
 
 At every single intersection point on this grid (the picture taken from page 3 in that HotChips pdf above), there is a physical switch called a crosspoint. When some input row (a lane) wants to speak with an output column (some memory location), the hardware will close that specific crosspoint. What's great about this design is that InputA can talk with BankA at the same time as InputB talks with BankB. 
 
@@ -25,6 +27,8 @@ But very often you do want a single column's (filing cabinet's) data at the same
 Imagine a Sudoku board where the first column is all 1s, the second column all 2s, etc, up to column 9 (this is obviously an "illegal" Sudoku board). Now overlay in your mind the swizzle switch image from above. If I ask for all of column 1s data (all the 1s), it will take 9 cycles to get all of our 1s data because each row is on the same bank. Now imagine a solved Sudoku puzzle and overlay that same swizzle switch image. Obtaining our 1s now takes a single cycle. The catch is we need to know which column our 1s were moved to. We need a sort of a function that can both write in some "funky" way to SMEM then read in that same "funky" way from SMEM, while keeping the actual data that is accessed invariant.
 
 When we talk of swizzling, this data movement is what we're speaking about. The question is how do we create that "funky" function. 
+
+### Creating the swizzle
 
 Let's shrink our problem down a bit to an 8x8 chunk. We want some function that changes the literal address of where some data will be stored then accessed. We know we're really just trying to rearrange row data. And that each memory bank is 4 bytes wide (i.e. 32 bits). So, 8 elements wide * 4 bytes per element * 8 bits per byte == 256 contiguous bits wide.
 
@@ -82,7 +86,7 @@ XOR is interesting because its self inverting (i.e. `a ^ b ^ b == a`). It's also
 Putting this all together, our funky function will be:
 On before write into SMEM, an xor function will get applied such that the data that was meant to be written to some address, will be written to the address with the transformation of `column bits = column bits ^ row bits` applied. Reading from SMEM is then simply reading from the address with that same transformation applied.
 
-And this is pretty much the exact logic as to how [cutlass performs](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/nvgpu/warpgroup/helpers.py#L51) their [swizzling math](https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py#L1035)!
+And this is pretty much the exact logic as to how [cutlass performs](https://github.com/NVIDIA/cutlass/blob/546c3efa899ed1793d178a26fe764d63f93b49ea/python/CuTeDSL/cutlass/cute/nvgpu/warpgroup/helpers.py#L25) their [swizzling math](https://github.com/NVIDIA/cutlass/blob/546c3efa899ed1793d178a26fe764d63f93b49ea/python/CuTeDSL/cutlass/cute/core.py#L1035)!
 
 To visualize what this sort of swizzle might look like as it relates to how the data might be stored into smem, you can run ![this](assets/swizzle_script.py), which is effectively only these lines:
 
@@ -115,3 +119,36 @@ for r in range(ROWS):
 It's output looks like
 
 ![this](assets/swizzle_script_run.png)
+
+I hope seeing these types of pictures begins to make more sense!
+
+### Different solutions
+
+Padding is one different solution that you may see discussed, and in a way, reframes the problem. In our swizzling example above, we had a chunk of 8x8 data and wanted to change the layout of the data within the chunk itself. Implicitly, we were creating some object whose shape was (8, 8) and whose stride was (8, 1). Meaning, from column-to-column, the distance traveled is 1 unit, and from row-to-row the distance traveled is 8 units. Accessing data, given some layout, implicitly uses the stride information to know how to retrieve the data. Accessing row 4, col 2 would mean `address = 4 * 8 + 2 * 1` where the 8 and 1 directly map to our strides assuming were using row-major ordering.
+
+Crucially, a layout is not the data itself. We can take a chunk of data (say `32 x 32`) and place it into a sort of container of shape `32 x 33` with stride (33, 1). Now, by changing the stride, each row's starting bank will shift by one relative to previous row's bank.
+
+```
+# Bank conflict!
+row 0, col 0: addr =  0*32 + 0 =    0  -> bank  0 % 32 = 0
+row 1, col 0: addr =  1*32 + 0 =   32  -> bank 32 % 32 = 0
+row 2, col 0: addr =  2*32 + 0 =   64  -> bank 64 % 32 = 0
+
+# No bank conflict!
+row 0, col 0: addr =  0*33 + 0 =    0  -> bank  0 % 32 = 0
+row 1, col 0: addr =  1*33 + 0 =   33  -> bank 33 % 32 = 1
+row 2, col 0: addr =  2*33 + 0 =   66  -> bank 66 % 32 = 2
+row 3, col 0: addr =  3*33 + 0 =   99  -> bank 99 % 32 = 3
+...
+row 31, col 0: addr = 31*33 + 0 = 1023 -> bank 1023 % 32 = 31
+```
+
+Padding, though wasteful, works for every column. Feel free to play with the [padding script](assets/padding_script.py) to see. Aside: your padding doesn't need to necessarily be 1 (though it is the least wasteful choice), all you need is for your number to be co-prime, i.e. have their greatest common divisor to be 1.
+
+### Conclusion
+
+Nvidia very much wants you to use swizzling. Their CuTe library abstracts away needing to think about swizzled data access patterns by giving you access to a _functional_ [composition](https://docs.nvidia.com/cutlass/latest/media/docs/cpp/cute/02_layout_algebra.html#composition) of layouts. The functional aspect of the composition, [that we might use for our swizzling](https://github.com/NVIDIA/cutlass/blob/546c3efa899ed1793d178a26fe764d63f93b49ea/python/CuTeDSL/cutlass/cute/nvgpu/warpgroup/helpers.py#L25), is that under the hood, when you ask for a piece of data at some specific index, the compiler handles the underlying XOR transformations. For instance, say you ask for some data at location `i` on your `input_data`, i.e. `input_data[i]`. The code that actually gets emitted by the compiler might actually be `input_data[swizzle_fn(i)]`. 
+
+The evolution of swizzling, from manual software bit-flipping to CuTe templates, is that starting with the Hopper generation of chips, swizzling is now baked into the silicon. TMA (Tensor Memory Accelerator) was introduced as a dedicated hardware unit that handles asynchronous data movement between GMEM and SMEM. And it has support for hardware native swizzling logic. After creating our composed layout as discussed above, we can use that composed layout directly with our [tma operations](https://github.com/NVIDIA/cutlass/blob/546c3efa899ed1793d178a26fe764d63f93b49ea/python/CuTeDSL/cutlass/cute/nvgpu/cpasync/helpers.py#L403).
+
+I hope this was informative and that you have a deeper appreciation for swizzling!

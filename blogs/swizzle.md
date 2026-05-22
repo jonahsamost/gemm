@@ -76,7 +76,7 @@ If we look back up to starting addresses, bits 2-4 all correspond to the column 
 
 At base this function needs to be a bijection. This is a function where every input maps to a unique output, and every possible output has exactly one input that maps to it. I.e. the function is one-to-one and onto.
 
-Addition might work. Addition would need an inverse (namely subtraction). If you were to add the row bits into the column bits on write, you would need to deal with carry bits. But this could be handled if on read (subtracting the columns from the row bits) you enounter a negative value. 
+Addition might work. Addition would need an inverse (namely subtraction). If you were to add the row bits into the column bits on write, you would need to deal with carry bits. But this could be handled if on read (subtracting the columns from the row bits) you enounter a negative value. You can run [this](assets/swizzle_add.py) script to try for yourself!
 
 The and operation wouldn't work. Consider, `0b01 & 0b10 == 0b01 & 0b00 == 0b00`.
 The or operation also wouldn't work. Consider, `0b01 | 0b10 == 0b01 | 0b11 == 0b11`.

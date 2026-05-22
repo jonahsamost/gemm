@@ -10,13 +10,13 @@ The [crossbar switch](https://web.eecs.umich.edu/~tnm/trev_test/papersPDF/2012.8
 
 At every single intersection point on this grid (the picture taken from page 3 in that HotChips pdf above), there is a physical switch called a crosspoint. When some input row (a lane) wants to speak with an output column (some memory location), the hardware will close that specific crosspoint. What's great about this design is that InputA can talk with BankA at the same time as InputB talks with BankB. 
 
-The dream, one might think, would be a sort of true multi-ported SRAM, where 32 threads each have their own independent port into the same memory array, so that all reads and writes can occur simultaneously with zero contention. Unfortunately, this approach would require nearly 70 transistors and a bunch of wiring per single SRAM memory cell, and the GPU would run incredibly hot and slow. 
+The dream, one might think, would be a sort of true multi-ported SRAM, where 32 threads each have their own independent port into the same memory array, so that all reads and writes can occur simultaneously with zero contention. Unfortunately, this approach would require an untenable amount of wiring and transistors, and the GPU would run incredinly slow and hot.
 
 What the crossbar allows for is the illusion of this dream by separating routing complexity from memory capacity. If shared memory grew from 128KB to 256KB, nothing happens to the size of the crossbar whereas for the 32-port dream, you'd need many many more wires. 
 
 Note: We will mainly be speaking to SMEM in this blog, but global memory (using DRAM) conflicts have a fundamentally similar nature, except that DRAM bank conflicts occur when threads access different rows of the same VRAM bank. 
 
-The crossbar works super well until multiple inputs try to retrieve data on the same output column simultaneously. However, multiple inputs are _physically_ unable to both claim access to some column simultaneously, and so the crossbar is forced to engage in some arbitration mechanism for who gets access first. This is a bank conflict.
+The crossbar works super well until multiple inputs try to retrieve data on the same output column simultaneously. Multiple inputs are _physically_ unable to both claim access to some column simultaneously, and so the crossbar is forced to engage in some arbitration mechanism for who gets access first. This is a bank conflict.
 
 Now applying that picture to our GPU, we have 32 input lanes (threads in a warp) mapped to 32 output lanes (32 SRAM banks) where the width of a single bank is 4 bytes. To avoid bank conflicts, we always want each thread to drive a different output bank than every other thread.
 

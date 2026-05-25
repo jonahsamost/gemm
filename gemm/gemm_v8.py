@@ -14,7 +14,7 @@ from cutlass.cute.nvgpu.warp import StMatrix8x8x16bOp
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from tile_scheduler import TileScheduler, TileSchedulerArgs, RasterOrder
+from tile_scheduler import TileScheduler, TileSchedulerArgs, RasterOrder, PersistenceMode
 from cta_swizzle import get_swizzle_block
 from smem_utils import make_smem_layout, make_epi_smem_layout
 from utils import NamedBarrier, make_pipeline_state, tma_get_copy_fn
@@ -30,7 +30,9 @@ class GemmSm90_v8:
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         cluster_shape_mnk: Tuple[int, int, int] = (1, 1, 1),
         pingpong: bool = True,
+        persistence_mode: PersistenceMode = PersistenceMode.DYNAMIC,
     ):
+        self.persistence_mode = persistence_mode
         self.pingpong = pingpong
         self.acc_dtype = acc_dtype
         self.cluster_shape_mnk = cluster_shape_mnk
@@ -794,6 +796,7 @@ class GemmSm90_v8:
             group_size=self.cta_swizzle_width,
             cluster_shape_mnk=self.cluster_shape_mnk,
             tile_count_semaphore=tile_cnt_semaphore,
+            persistence_mode=self.persistence_mode,
         )
         return sched_args
     

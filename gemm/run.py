@@ -3,6 +3,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
 
+from tile_scheduler import PersistenceMode
 from correctness import check_correctness
 from benchmark import bench_and_report
 # from gemm_v1 import GemmSm90_v1
@@ -39,6 +40,7 @@ def _gemm_fn(
         )
         fn = cute.compile(
             GemmSm90(
+                persistence_mode=PersistenceMode.NONE,
                 tile_shape_mnk=(128, 208), # v8
                 cluster_shape_mnk=(2, 1, 1),
                 # tile_shape_mnk=(128, 256), # v7

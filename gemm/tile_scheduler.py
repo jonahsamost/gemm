@@ -21,6 +21,13 @@ class PersistenceMode(IntEnum):
     DYNAMIC = 2
 
 
+class CTATileOrdering(IntEnum):
+    NONE = 0
+    ONLINE_SWIZZLE = 1
+    OFFLINE_SWIZZLE = 2
+    HILBERT = 3
+
+
 @dataclass
 class TileSchedulerArgs:
     problem_shape_ntile_mnl: cute.Shape
@@ -28,7 +35,9 @@ class TileSchedulerArgs:
     group_size: Int32
     cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
     tile_count_semaphore: Optional[cute.Pointer]
+    tile_order_lut: Optional[cute.Pointer] = None
     persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.DYNAMIC
+    tile_ordering: cutlass.Constexpr[CTATileOrdering] = CTATileOrdering.ONLINE_SWIZZLE
 
 
 class TileScheduler:
@@ -42,8 +51,10 @@ class TileScheduler:
         group_size_tail_fdd: FastDivmod
         num_clusters_in_group_fdd: FastDivmod
         tile_count_semaphore: Optional[cute.Pointer]
+        tile_order_lut: Optional[cute.Pointer]
         cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
+        tile_ordering: cutlass.Constexpr[CTATileOrdering]
 
         @staticmethod
         @cute.jit
@@ -87,8 +98,14 @@ class TileScheduler:
                 args.tile_count_semaphore
                 if const_expr(args.persistence_mode == PersistenceMode.DYNAMIC)
                 else None,
+                args.tile_order_lut
+                if const_expr(args.tile_ordering in (
+                    CTATileOrdering.OFFLINE_SWIZZLE, CTATileOrdering.HILBERT
+                ))
+                else None,
                 args.cluster_shape_mnk,
                 args.persistence_mode,
+                args.tile_ordering,
             )
 
     def __init__(
@@ -200,7 +217,16 @@ class TileScheduler:
                 )
             if const_expr(bidz is not None):
                 bidz_ = bidz
-            cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)
+            if const_expr(params.tile_ordering == CTATileOrdering.ONLINE_SWIZZLE):
+                cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)
+            elif const_expr(params.tile_ordering in (
+                CTATileOrdering.OFFLINE_SWIZZLE, CTATileOrdering.HILBERT
+            )):
+                packed = params.tile_order_lut[cluster_id_in_problem]
+                cid_m = packed >> 16
+                cid_n = packed & 0xFFFF
+            else:
+                cid_m, cid_n = self._naive_raster(cluster_id_in_problem, loc=loc, ip=ip)
             pid_m, pid_n = self._cluster_id_to_cta_id(
                 cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
             )
@@ -231,7 +257,24 @@ class TileScheduler:
         if params.raster_order == RasterOrder.AlongN:
             cid_m, cid_n = cid_slow, cid_fast
         return cid_m, cid_n
-    
+
+    @cute.jit
+    def _naive_raster(
+        self, cluster_id_in_problem: Int32, *, loc=None, ip=None
+    ) -> Tuple[Int32, Int32]:
+        params = self.params
+        ncluster_m = params.problem_shape_ncluster_mnl[0]
+        ncluster_n = params.problem_shape_ncluster_mnl[1]
+        ncluster_fast = (
+            ncluster_m if params.raster_order == RasterOrder.AlongM else ncluster_n
+        )
+        cid_fast = cluster_id_in_problem % ncluster_fast
+        cid_slow = cluster_id_in_problem // ncluster_fast
+        cid_m, cid_n = cid_fast, cid_slow
+        if params.raster_order == RasterOrder.AlongN:
+            cid_m, cid_n = cid_slow, cid_fast
+        return cid_m, cid_n
+
     @cute.jit
     def _cluster_id_to_cta_id(
         self, cid_m: Int32, cid_n: Int32, *, block_zero_only: bool = False, loc=None, ip=None

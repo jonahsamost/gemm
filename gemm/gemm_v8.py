@@ -14,7 +14,7 @@ from cutlass.cute.nvgpu.warp import StMatrix8x8x16bOp
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from tile_scheduler import TileScheduler, TileSchedulerArgs, RasterOrder, PersistenceMode
+from tile_scheduler import CTATileOrdering, TileScheduler, TileSchedulerArgs, RasterOrder, PersistenceMode
 from cta_swizzle import get_swizzle_block
 from smem_utils import make_smem_layout, make_epi_smem_layout
 from utils import NamedBarrier, make_pipeline_state, tma_get_copy_fn
@@ -31,7 +31,9 @@ class GemmSm90_v8:
         cluster_shape_mnk: Tuple[int, int, int] = (1, 1, 1),
         pingpong: bool = True,
         persistence_mode: PersistenceMode = PersistenceMode.DYNAMIC,
+        tile_ordering: CTATileOrdering = CTATileOrdering.ONLINE_SWIZZLE,
     ):
+        self.tile_ordering = tile_ordering
         self.persistence_mode = persistence_mode
         self.pingpong = pingpong
         self.acc_dtype = acc_dtype
@@ -133,6 +135,7 @@ class GemmSm90_v8:
         B: cute.Tensor,
         D: cute.Tensor,
         tile_count_semaphore: cute.Pointer,
+        tile_order_lut: cute.Pointer,
         stream: cuda.CUstream
     ):
         self.a_dtype = A._dtype
@@ -165,7 +168,7 @@ class GemmSm90_v8:
         )
 
         tile_sched_args = self.get_sched_args(
-            A, B, D, tile_count_semaphore
+            A, B, D, tile_count_semaphore, tile_order_lut
         )
         tile_sched_params = TileScheduler.create_params(tile_sched_args)
         grid = TileScheduler.get_grid_shape(tile_sched_params, self.max_active_clusters)
@@ -780,9 +783,10 @@ class GemmSm90_v8:
         return tiled_copy_r2s, tRS_rD, tRS_sD
     
     def get_sched_args(
-        self, 
+        self,
         A: cute.Tensor, B: cute.Tensor, D: cute.Tensor,
         tile_cnt_semaphore: cute.Pointer,
+        tile_order_lut: cute.Pointer,
     ):
         m, n = cute.size(A, mode=[0]), cute.size(B, mode=[0])
         mnl_shape = (
@@ -796,7 +800,9 @@ class GemmSm90_v8:
             group_size=self.cta_swizzle_width,
             cluster_shape_mnk=self.cluster_shape_mnk,
             tile_count_semaphore=tile_cnt_semaphore,
+            tile_order_lut=tile_order_lut,
             persistence_mode=self.persistence_mode,
+            tile_ordering=self.tile_ordering,
         )
         return sched_args
     

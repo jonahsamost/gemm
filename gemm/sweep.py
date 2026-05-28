@@ -14,8 +14,8 @@ from benchmark import bench_and_report
 _compile_cache = {}
 _lut_cache = {}
 
-TILE_SHAPE = (128, 128)
-CLUSTER_SHAPE = (1, 1, 1)
+TILE_SHAPE = (128, 256)
+CLUSTER_SHAPE = (2, 1, 1)
 
 '''
 python sweep.py &> /tmp/output.log 2>&1
@@ -44,8 +44,8 @@ def get_compiled_fn(tile_ordering, persistence_mode, group_size=8):
             tile_ordering=tile_ordering,
             tile_shape_mnk=TILE_SHAPE,
             cluster_shape_mnk=CLUSTER_SHAPE,
+            cta_swizzle_width=group_size
         )
-        gemm.cta_swizzle_width = group_size
         fn = cute.compile(
             gemm,
             a_fake, b_fake, out_fake,
@@ -91,7 +91,9 @@ def run_config(M, N, K, tile_ordering, persistence_mode, group_size=8):
         CTATileOrdering.ONLINE_SWIZZLE, CTATileOrdering.OFFLINE_SWIZZLE
     ) else ""
     label = f"{tile_ordering.name:>16s}{gs_str} / {persistence_mode.name:<8s}"
-    bench_and_report(label, lambda: fn(A, B, out, sem.data_ptr(), lut_ptr), flops)
+    t_custom = bench_and_report(label, lambda: fn(A, B, out, sem.data_ptr(), lut_ptr), flops)
+    t_cublas = bench_and_report("cuBLAS", lambda: torch.mm(A, B.T), flops)
+    print(f"\ncuBLAS speedup over custom: {t_cublas / t_custom:.2f}x")
 
 
 if __name__ == "__main__":
@@ -99,14 +101,22 @@ if __name__ == "__main__":
 
     persistence_modes = [
         # PersistenceMode.NONE,
-        PersistenceMode.STATIC,
+        # PersistenceMode.STATIC,
         PersistenceMode.DYNAMIC,
     ]
-    group_sizes = [8, 12, 16, 20, 24, 28, 32]
+    orderings = [
+        CTATileOrdering.ONLINE_SWIZZLE,
+        # CTATileOrdering.OFFLINE_SWIZZLE,
+        # CTATileOrdering.NONE,
+        # CTATileOrdering.HILBERT,
+    ]
+    group_sizes = [4, 6, 8, 12, 16, 20, 24, 28, 32]
 
     for persistence in persistence_modes:
         # Swizzle orderings (sweep group_size)
         for ordering in [CTATileOrdering.ONLINE_SWIZZLE, CTATileOrdering.OFFLINE_SWIZZLE]:
+            if ordering not in orderings:
+                continue
             for gs in group_sizes:
                 print(f"\n=== {ordering.name} gs={gs} / {persistence.name} ===")
                 try:
@@ -116,8 +126,11 @@ if __name__ == "__main__":
 
         # Non-swizzle orderings (group_size irrelevant)
         for ordering in [CTATileOrdering.NONE, CTATileOrdering.HILBERT]:
+            if ordering not in orderings:
+                continue
             print(f"\n=== {ordering.name} / {persistence.name} ===")
             try:
                 run_config(M, N, K, ordering, persistence)
             except Exception as e:
                 print(f"  FAILED: {e}")
+    

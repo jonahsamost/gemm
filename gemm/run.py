@@ -1,3 +1,4 @@
+import argparse
 import math
 import torch
 import cutlass
@@ -8,31 +9,23 @@ from tile_scheduler import PersistenceMode, CTATileOrdering
 from cta_swizzle import create_swizzle_lut, create_hilbert_lut
 from correctness import check_correctness
 from benchmark import bench_and_report
-# from gemm_v1 import GemmSm90_v1
-# from gemm_v2 import GemmSm90_v2
-# from gemm_v3 import GemmSm90_v3
-# from gemm_v4 import GemmSm90_v4 as GemmSm90
-# from gemm_v5 import GemmSm90_v5 as GemmSm90
-# from gemm_v6 import GemmSm90_v6 as GemmSm90
-# from gemm_v7 import GemmSm90_v7 as GemmSm90
 from gemm_v8 import GemmSm90_v8 as GemmSm90
 
-TILE_ORDERING = CTATileOrdering.HILBERT
-PERSISTENCE_MODE = PersistenceMode.NONE
-TILE_SHAPE_MNK = (128, 128)
-CLUSTER_SHAPE_MNK = (1, 1, 1)
-CTA_SWIZZLE_WIDTH = 8
+'''
+Profile with:
+ncu --set full python run.py --ordering hilbert --no-bench &> /tmp/output_ncu.log 2>&1
+
+ncu --metrics regex:lts__,regex:dram__ --kernel-name regex:kernel_cutlass \
+    python run.py --ordering hilbert --no-bench &> /tmp/output_ncu.log 2>&1
+'''
+
+_compile_cache = {}
+_lut_cache = {}
 
 
-@torch.library.custom_op("jonah::gemm_fn", mutates_args={"out", "tile_count_semaphore"})
-def _gemm_fn(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    out: torch.Tensor,
-    tile_count_semaphore: torch.Tensor,
-) -> None:
-    compile_key = ()
-    if compile_key not in _gemm_fn.compile_cache:
+def get_compiled_fn(tile_ordering, persistence_mode, tile_shape, cluster_shape, group_size):
+    key = (tile_ordering, persistence_mode, tile_shape, cluster_shape, group_size)
+    if key not in _compile_cache:
         m = cute.sym_int(divisibility=8)
         n = cute.sym_int(divisibility=8)
         k = cute.sym_int(divisibility=8)
@@ -42,79 +35,105 @@ def _gemm_fn(
         b_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.BFloat16, (n, k), stride_order=(1, 0), assumed_align=128
         )
-        tile_count_sem_fake = make_ptr(cutlass.Int32, 0, cute.AddressSpace.gmem, assumed_align=4)
-        tile_order_lut_fake = make_ptr(cutlass.Int32, 0, cute.AddressSpace.gmem, assumed_align=4)
         out_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.BFloat16, (m, n), stride_order=(1, 0), assumed_align=128
         )
+        sem_fake = make_ptr(cutlass.Int32, 0, cute.AddressSpace.gmem, assumed_align=4)
+        lut_fake = make_ptr(cutlass.Int32, 0, cute.AddressSpace.gmem, assumed_align=4)
+        gemm = GemmSm90(
+            persistence_mode=persistence_mode,
+            tile_ordering=tile_ordering,
+            tile_shape_mnk=tile_shape,
+            cluster_shape_mnk=cluster_shape,
+            cta_swizzle_width=group_size,
+        )
         fn = cute.compile(
-            GemmSm90(
-                persistence_mode=PERSISTENCE_MODE,
-                tile_ordering=TILE_ORDERING,
-                tile_shape_mnk=TILE_SHAPE_MNK,
-                cluster_shape_mnk=CLUSTER_SHAPE_MNK,
-            ),
+            gemm,
             a_fake, b_fake, out_fake,
-            tile_count_sem_fake,
-            tile_order_lut_fake,
+            sem_fake, lut_fake,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
-        _gemm_fn.compile_cache[compile_key] = fn
-
-    m, n = A.size(0), B.size(0)
-    lut_ptr = _get_tile_order_lut(m, n)
-    _gemm_fn.compile_cache[compile_key](
-        A, B, out, tile_count_semaphore.data_ptr(), lut_ptr
-    )
+        _compile_cache[key] = fn
+    return _compile_cache[key]
 
 
-_gemm_fn.compile_cache = {}
-_gemm_fn.lut_cache = {}
-
-
-def _get_tile_order_lut(m, n):
-    """Create or retrieve cached tile-order LUT; returns data_ptr (int)."""
-    if TILE_ORDERING not in (CTATileOrdering.OFFLINE_SWIZZLE, CTATileOrdering.HILBERT):
+def get_lut_ptr(tile_ordering, m, n, tile_shape, group_size):
+    if tile_ordering not in (CTATileOrdering.OFFLINE_SWIZZLE, CTATileOrdering.HILBERT):
         return 0
-    ncluster_m = math.ceil(m / TILE_SHAPE_MNK[0])
-    ncluster_n = math.ceil(n / TILE_SHAPE_MNK[1])
-    cache_key = (TILE_ORDERING, ncluster_m, ncluster_n)
-    if cache_key not in _gemm_fn.lut_cache:
-        if TILE_ORDERING == CTATileOrdering.OFFLINE_SWIZZLE:
-            lut = create_swizzle_lut(ncluster_m, ncluster_n, CTA_SWIZZLE_WIDTH)
+    ncluster_m = math.ceil(m / tile_shape[0])
+    ncluster_n = math.ceil(n / tile_shape[1])
+    cache_key = (tile_ordering, ncluster_m, ncluster_n, group_size)
+    if cache_key not in _lut_cache:
+        if tile_ordering == CTATileOrdering.OFFLINE_SWIZZLE:
+            _lut_cache[cache_key] = create_swizzle_lut(ncluster_m, ncluster_n, group_size)
         else:
-            lut = create_hilbert_lut(ncluster_m, ncluster_n)
-        _gemm_fn.lut_cache[cache_key] = lut
-    return _gemm_fn.lut_cache[cache_key].data_ptr()
+            _lut_cache[cache_key] = create_hilbert_lut(ncluster_m, ncluster_n)
+    return _lut_cache[cache_key].data_ptr()
 
 
-def gemm_fn(
-    A: torch.Tensor, B: torch.Tensor
+def run(
+    M, N, K,
+    tile_ordering, persistence_mode, tile_shape, cluster_shape, group_size, bench=True
 ):
-    tile_cnt_semaphore = torch.zeros(1, device=A.device, dtype=torch.int32)
-    m = A.size(0)
-    n = B.size(0)
-    out = torch.empty((m, n), device=A.device, dtype=A.dtype)
-    _gemm_fn(A, B, out, tile_cnt_semaphore)
-    return out
+    A = torch.randn((M, K), device="cuda", dtype=torch.bfloat16)
+    B = torch.randn((N, K), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty((M, N), device=A.device, dtype=A.dtype)
+    sem = torch.zeros(1, device="cuda", dtype=torch.int32)
+
+    fn = get_compiled_fn(tile_ordering, persistence_mode, tile_shape, cluster_shape, group_size)
+    lut_ptr = get_lut_ptr(tile_ordering, M, N, tile_shape, group_size)
+
+    fn(A, B, out, sem.data_ptr(), lut_ptr)
+
+    if bench:
+        ref = A @ B.T
+        check_correctness(out, ref)
+
+        flops = 2 * M * N * K
+        bytes_total = (M * K + N * K + M * N) * 2
+        t_custom = bench_and_report("custom", lambda: fn(A, B, out, sem.data_ptr(), lut_ptr),
+                                    flops, gbps_bytes=bytes_total)
+        t_cublas = bench_and_report("cuBLAS", lambda: torch.mm(A, B.T), flops, gbps_bytes=bytes_total)
+        print(f"\ncuBLAS speedup over custom: {t_cublas / t_custom:.2f}x")
 
 
-M = N = K = 8192
-A = torch.randn((M, K), device='cuda', dtype=torch.bfloat16)
-B = torch.randn((N, K), device='cuda', dtype=torch.bfloat16)
-out = gemm_fn(A, B)
+ORDERING_NAMES = {
+    "naive": CTATileOrdering.NONE,
+    "none": CTATileOrdering.NONE,
+    "online_swizzle": CTATileOrdering.ONLINE_SWIZZLE,
+    "offline_swizzle": CTATileOrdering.OFFLINE_SWIZZLE,
+    "hilbert": CTATileOrdering.HILBERT,
+}
 
-ref = A @ B.T
-check_correctness(out, ref)
+PERSISTENCE_NAMES = {
+    "none": PersistenceMode.NONE,
+    "static": PersistenceMode.STATIC,
+    "dynamic": PersistenceMode.DYNAMIC,
+}
 
-flops = 2 * M * N * K
-bytes_total = (M * K + N * K + M * N) * 2  # bf16 = 2 bytes
-def fn_custom():
-    gemm_fn(A, B)
-t_custom = bench_and_report("custom", fn_custom, flops, gbps_bytes=bytes_total)
-# Benchmark cuBLAS
-def fn_cublas():
-    torch.mm(A, B.T)
-t_cublas = bench_and_report("cuBLAS", fn_cublas, flops, gbps_bytes=bytes_total)
-print(f"\ncuBLAS speedup over custom: {t_cublas / t_custom:.2f}x")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ordering", choices=list(ORDERING_NAMES), default="hilbert")
+    parser.add_argument("--persistence", choices=list(PERSISTENCE_NAMES), default="dynamic")
+    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("-M", type=int, default=8192)
+    parser.add_argument("-N", type=int, default=8192)
+    parser.add_argument("-K", type=int, default=8192)
+    parser.add_argument("--no-bench", action="store_true")
+    args = parser.parse_args()
+
+    tile_ordering = ORDERING_NAMES[args.ordering]
+    persistence_mode = PERSISTENCE_NAMES[args.persistence]
+
+    print(f"ordering={args.ordering}  persistence={args.persistence}  "
+          f"group_size={args.group_size}  M={args.M} N={args.N} K={args.K}")
+
+    run(
+        args.M, args.N, args.K,
+        tile_ordering, persistence_mode,
+        tile_shape=(128, 128), cluster_shape=(2, 1, 1),
+        group_size=args.group_size,
+        bench=not args.no_bench
+    )

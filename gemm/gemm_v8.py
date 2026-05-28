@@ -29,9 +29,10 @@ class GemmSm90_v8:
         tile_shape_mnk: Tuple[int, int] | Tuple[int, int, int] = (64, 128),
         acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
         cluster_shape_mnk: Tuple[int, int, int] = (1, 1, 1),
-        pingpong: bool = True,
+        pingpong: bool = False,
         persistence_mode: PersistenceMode = PersistenceMode.DYNAMIC,
         tile_ordering: CTATileOrdering = CTATileOrdering.ONLINE_SWIZZLE,
+        cta_swizzle_width: int = 8,
     ):
         self.tile_ordering = tile_ordering
         self.persistence_mode = persistence_mode
@@ -121,7 +122,7 @@ class GemmSm90_v8:
             barrier_id=NamedBarrier.Epilogue,
             num_threads=self.num_epi_warps * cute.arch.WARP_SIZE
         )
-        self.cta_swizzle_width = 8
+        self.cta_swizzle_width = cta_swizzle_width
         self.smem_capacity = cutlass.utils.get_smem_capacity_in_bytes("sm_90")
         cluster_size = math.prod(self.cluster_shape_mnk)
         self.max_active_clusters = (

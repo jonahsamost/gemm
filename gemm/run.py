@@ -15,7 +15,7 @@ from gemm_v8 import GemmSm90_v8 as GemmSm90
 Profile with:
 ncu --set full python run.py --ordering hilbert --no-bench &> /tmp/output_ncu.log 2>&1
 
-ncu --metrics regex:lts__,regex:dram__ --kernel-name regex:kernel_cutlass \
+ncu --metrics regex:lts__,regex:dram__,regex:smsp__ --kernel-name regex:kernel_cutlass \
     python run.py --ordering hilbert --no-bench &> /tmp/output_ncu.log 2>&1
 '''
 
@@ -133,7 +133,7 @@ if __name__ == "__main__":
     run(
         args.M, args.N, args.K,
         tile_ordering, persistence_mode,
-        tile_shape=(128, 128), cluster_shape=(2, 1, 1),
+        tile_shape=(128, 256), cluster_shape=(1, 1, 1),
         group_size=args.group_size,
         bench=not args.no_bench
     )

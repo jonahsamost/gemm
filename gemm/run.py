@@ -117,7 +117,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ordering", choices=list(ORDERING_NAMES), default="online_swizzle")
     parser.add_argument("--persistence", choices=list(PERSISTENCE_NAMES), default="dynamic")
-    parser.add_argument("--group-size", type=int, default=8)
+    parser.add_argument("--group-size", type=int, default=12)
     parser.add_argument("-M", type=int, default=8192)
     parser.add_argument("-N", type=int, default=8192)
     parser.add_argument("-K", type=int, default=8192)
@@ -133,7 +133,7 @@ if __name__ == "__main__":
     run(
         args.M, args.N, args.K,
         tile_ordering, persistence_mode,
-        tile_shape=(128, 256), cluster_shape=(1, 1, 1),
+        tile_shape=(128, 256), cluster_shape=(2, 1, 1),
         group_size=args.group_size,
         bench=not args.no_bench
     )

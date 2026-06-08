@@ -5,7 +5,7 @@ POD_IP="$1"
 POD_PORT="$2"
 LOCAL_DIR="./"
 REMOTE_DIR="jonah@${POD_IP}:/home/jonah/gemm/"
-KEY_PATH="~/.ssh/id_ed25519_runpod"
+KEY_PATH="~/.ssh/id_ed25519"
 # ---------------------
 
 # Define the RSYNC command with specific includes/excludes

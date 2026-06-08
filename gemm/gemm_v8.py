@@ -33,7 +33,11 @@ class GemmSm90_v8:
         persistence_mode: PersistenceMode = PersistenceMode.DYNAMIC,
         tile_ordering: CTATileOrdering = CTATileOrdering.ONLINE_SWIZZLE,
         cta_swizzle_width: int = 8,
+        k_depth: int = 4,
+        k_pipe_mmas: int = 1,
     ):
+        self.k_depth = k_depth
+        self.k_pipe_mmas = k_pipe_mmas
         self.tile_ordering = tile_ordering
         self.persistence_mode = persistence_mode
         self.pingpong = pingpong
@@ -82,6 +86,7 @@ class GemmSm90_v8:
                 atom_layout_n = 1
         else:
             atom_layout_m, atom_layout_n = 1, 1
+
         assert atom_layout_m in [1, 2, 3] and atom_layout_n in [1, 2]
         self.atom_layout_mnk = (atom_layout_m, atom_layout_n, 1)
         if self.pingpong:
@@ -332,7 +337,8 @@ class GemmSm90_v8:
             epi_store_pipeline = self.make_epi_store_pipeline()
             # partition smem for mma
             thr_mma = tiled_mma.get_slice(tidx)
-            acc = cute.make_rmem_tensor(thr_mma.partition_shape_C(tile_mn), cutlass.Float32)
+            acc_layout = thr_mma.partition_shape_C(tile_mn)
+            acc = cute.make_rmem_tensor(acc_layout, cutlass.Float32)
             tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA))
             tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
             acc.fill(0.0)
@@ -377,47 +383,63 @@ class GemmSm90_v8:
                 )
                 
                 # MMA
-                k_pipe_mmas = 1
-                ab_release_state = tma_consumer_state.clone()
-                peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
-                for k in cutlass.range(k_pipe_mmas):
-                    tma_load_pipeline.consumer_wait(tma_consumer_state, peek_load_status)
-                    self.gemm(
-                        tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
-                        wg_wait=1, zero_init=True
-                    )
-                    tma_consumer_state.advance()
-                    if k + 1 < kiters:
-                        peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
+                if cutlass.const_expr(self.ab_stage == 1 or self.k_pipe_mmas == 0):
+                    peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
+                    for k in cutlass.range(kiters, unroll=1):
+                        tma_load_pipeline.consumer_wait(tma_consumer_state, peek_load_status)
+                        self.gemm(
+                            tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
+                            wg_wait=0,
+                            zero_init=k==0,
+                        )
+                        tma_load_pipeline.consumer_release(tma_consumer_state)
+                        tma_consumer_state.advance()
+                        peek_load_status = Boolean(True)
+                        if k + 1 < kiters:
+                            peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
+                    
+                else:
+                    ab_release_state = tma_consumer_state.clone()
+                    peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
+                    for k in cutlass.range_constexpr(self.k_pipe_mmas):
+                        tma_load_pipeline.consumer_wait(tma_consumer_state, peek_load_status)
+                        self.gemm(
+                            tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
+                            wg_wait=self.k_pipe_mmas, zero_init=k==0
+                        )
+                        tma_consumer_state.advance()
+                        if k + 1 < kiters:
+                            peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
 
-                for k in cutlass.range(k_pipe_mmas, kiters, unroll=1):
-                    tma_load_pipeline.consumer_wait(tma_consumer_state, peek_load_status)
-                    self.gemm(
-                        tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
-                        wg_wait=1, zero_init=False
-                    )
-                    tma_load_pipeline.consumer_release(ab_release_state)
-                    ab_release_state.advance()
-                    tma_consumer_state.advance()
-                    peek_load_status = Boolean(True)
-                    if k + 1 < kiters:
-                        peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
+                    for k in cutlass.range(self.k_pipe_mmas, kiters, unroll=1):
+                        tma_load_pipeline.consumer_wait(tma_consumer_state, peek_load_status)
+                        self.gemm(
+                            tiled_mma, acc, tCrA, tCrB, tma_consumer_state.index,
+                            wg_wait=self.k_pipe_mmas, zero_init=False
+                        )
+                        tma_load_pipeline.consumer_release(ab_release_state)
+                        ab_release_state.advance()
+                        tma_consumer_state.advance()
+                        peek_load_status = Boolean(True)
+                        if k + 1 < kiters:
+                            peek_load_status = tma_load_pipeline.consumer_try_wait(tma_consumer_state)
 
-                if const_expr(self.pingpong):
-                    self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
+                    if const_expr(self.pingpong):
+                        self.pingpong_barrier_arrive(1 - warp_group_idx, stage="mma")
 
-                warpgroup.wait_group(0)
-                
-                for k in cutlass.range(k_pipe_mmas):
-                    tma_load_pipeline.consumer_release(ab_release_state)
-                    ab_release_state.advance()
+                    warpgroup.wait_group(0)
+                    
+                    for k in cutlass.range_constexpr(self.k_pipe_mmas):
+                        tma_load_pipeline.consumer_release(ab_release_state)
+                        ab_release_state.advance()
                 
                 # Epilogue
                 if const_expr(self.pingpong):
                     self.pingpong_barrier_sync(warp_group_idx, stage="epi")
-                epi_tile_shape = cute.zipped_divide(
+                epi_tile_shape_in_out = cute.zipped_divide(
                     cute.make_layout(self.cta_tile_shape_mnk[:2]), self.epi_tile
-                ).shape[1] # outer
+                )
+                epi_tile_shape = epi_tile_shape_in_out.shape[1] # outer
                 epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(0, 1))
                 episize = cute.size(epi_tile_shape)
 
@@ -426,16 +448,17 @@ class GemmSm90_v8:
                     epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
                     data = tRS_rAcc[None, None, None, epi_coord].load()
                     if is_tma_warp:
-                        epi_store_pipeline.producer_acquire()
+                        with cute.arch.elect_one():
+                            epi_store_pipeline.producer_acquire()
                     self.epi_barrier.arrive_and_wait()
                     tRS_rD.store(data.to(self.d_dtype))
-                    # NOTE why does tiled_copy_r2s get used here?
                     cute.copy(tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer])
                     cute.arch.fence_view_async_shared()
                     self.epi_barrier.arrive_and_wait()
                     if is_tma_warp:
-                        tmaCopyD(epi_buffer, epi_coord)
-                        epi_store_pipeline.producer_commit()
+                        with cute.arch.elect_one():
+                            tmaCopyD(epi_buffer, epi_coord)
+                            epi_store_pipeline.producer_commit()
 
                 if const_expr(self.pingpong):
                     if is_tma_warp:
@@ -469,7 +492,6 @@ class GemmSm90_v8:
         mma_atom = cute.make_mma_atom(tiled_mma.op)
         mma_atom.set(warpgroup.Field.ACCUMULATE, not zero_init)
         for mma_k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
-            # is this async? does it block? is it queued in some tensor core buffer or something?
             cute.gemm(mma_atom, acc, tCrA[None, None, mma_k, state_idx], tCrB[None, None, mma_k, state_idx], acc)
             mma_atom.set(warpgroup.Field.ACCUMULATE, True)
         warpgroup.commit_group()
@@ -589,8 +611,8 @@ class GemmSm90_v8:
         self.epi_tile_shape = cute.ceil_div(
             self.cta_tile_shape_mnk[:2], self.epi_tile
         )
-        self.epi_stage = 4 if self.epi_tile[1] <= 16 else 2
-    
+        self.epi_stage = 4
+
     def _setup_stages(self):
         a_shape = cute.slice_(self.cta_tile_shape_mnk, (None, 0, None))
         b_shape = cute.slice_(self.cta_tile_shape_mnk, (0, None, None))
@@ -673,7 +695,7 @@ class GemmSm90_v8:
         
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         tile_k = (
-            self.cta_tile_shape_mnk[2] if self.cta_tile_shape_mnk[2] > 0 else mma_inst_shape_k * 4
+            self.cta_tile_shape_mnk[2] if self.cta_tile_shape_mnk[2] > 0 else mma_inst_shape_k * self.k_depth
         )
 
         assert tile_k > 0, "CTA tile K must be positive"
@@ -756,7 +778,9 @@ class GemmSm90_v8:
         tRS_rAcc = cute.group_modes(
             acc_divide[None, None, None, 0, None, None], 3, 5
         )
-        return tiled_copy_r2s.retile(tRS_rAcc)
+        retile = tiled_copy_r2s.retile(tRS_rAcc)
+        return retile
+        # return tiled_copy_r2s.retile(tRS_rAcc)
     
     def epilog_smem_store_and_partition(
         self,
@@ -765,7 +789,6 @@ class GemmSm90_v8:
         epi_tile: cute.Tile,
         tidx: cutlass.Int32,
     ) -> Tuple[cute.TiledCopy, cute.Tensor, cute.Tensor]:
-        # NOTE is this similar to like swizzling?
         copy_atom_C = cute.make_copy_atom(
             StMatrix8x8x16bOp(self.d_layout.is_m_major_c(), num_matrices=4),
             cutlass.BFloat16

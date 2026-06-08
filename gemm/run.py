@@ -115,7 +115,7 @@ PERSISTENCE_NAMES = {
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--ordering", choices=list(ORDERING_NAMES), default="hilbert")
+    parser.add_argument("--ordering", choices=list(ORDERING_NAMES), default="online_swizzle")
     parser.add_argument("--persistence", choices=list(PERSISTENCE_NAMES), default="dynamic")
     parser.add_argument("--group-size", type=int, default=8)
     parser.add_argument("-M", type=int, default=8192)

@@ -7,8 +7,8 @@ import cuda.bindings.driver as cuda
 from cutlass._mlir.dialects.cute import ReductionOp
 from cutlass.utils import LayoutEnum
 
-from cta_swizzle import get_swizzle_block
-from smem_utils import make_smem_layout, make_smem_layout_simple, partition_D_pos_ind, partition_S_pos_ind
+from gemm.cta_swizzle import get_swizzle_block
+from gemm.smem_utils import make_smem_layout, make_smem_layout_simple, partition_D_pos_ind, partition_S_pos_ind
 
 '''
 Implement CTA swizzling and smem swizzling

@@ -5,18 +5,18 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
 
-from tile_scheduler import PersistenceMode, CTATileOrdering
-from cta_swizzle import create_swizzle_lut, create_hilbert_lut
-from correctness import check_correctness
-from benchmark import bench_and_report
-from gemm_v8 import GemmSm90_v8 as GemmSm90
+from gemm.tile_scheduler import PersistenceMode, CTATileOrdering
+from gemm.cta_swizzle import create_swizzle_lut, create_hilbert_lut
+from utils.benchmark import bench_and_report
+from gemm.gemm_v8 import GemmSm90_v8 as GemmSm90
+from utils.correctness import check_correctness
 
 '''
 Profile with:
-ncu --set full python run.py --ordering hilbert --no-bench &> /tmp/output_ncu.log 2>&1
+ncu --set full python -m gemm.run --ordering hilbert --no-bench &> /tmp/output_ncu.log 2>&1
 
 ncu --metrics regex:lts__,regex:dram__,regex:smsp__ --kernel-name regex:kernel_cutlass \
-    python run.py --ordering hilbert --no-bench &> /tmp/output_ncu.log 2>&1
+    python -m gemm.run --ordering hilbert --no-bench &> /tmp/output_ncu.log 2>&1
 '''
 
 _compile_cache = {}

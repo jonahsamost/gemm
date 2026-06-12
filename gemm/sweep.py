@@ -5,11 +5,11 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
 from itertools import product
 
-from tile_scheduler import PersistenceMode, CTATileOrdering
-from cta_swizzle import create_swizzle_lut, create_hilbert_lut
-from gemm_v8 import GemmSm90_v8 as GemmSm90
-from correctness import check_correctness
-from benchmark import bench_and_report
+from gemm.tile_scheduler import PersistenceMode, CTATileOrdering
+from gemm.cta_swizzle import create_swizzle_lut, create_hilbert_lut
+from gemm.gemm_v8 import GemmSm90_v8 as GemmSm90
+from utils.correctness import check_correctness
+from utils.benchmark import bench_and_report
 
 _compile_cache = {}
 _lut_cache = {}

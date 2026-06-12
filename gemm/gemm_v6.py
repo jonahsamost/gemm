@@ -14,10 +14,10 @@ from cutlass.cute.nvgpu.warp import StMatrix8x8x16bOp
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from tile_scheduler import TileScheduler, TileSchedulerArgs, RasterOrder
-from cta_swizzle import get_swizzle_block
-from smem_utils import make_smem_layout, make_epi_smem_layout
-from utils import make_pipeline_state, tma_get_copy_fn
+from gemm.tile_scheduler import TileScheduler, TileSchedulerArgs, RasterOrder
+from gemm.cta_swizzle import get_swizzle_block
+from gemm.smem_utils import make_smem_layout, make_epi_smem_layout
+from gemm.utils import make_pipeline_state, tma_get_copy_fn
 
 '''
 adding dynamic persistent kernel

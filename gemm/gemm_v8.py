@@ -14,10 +14,10 @@ from cutlass.cute.nvgpu.warp import StMatrix8x8x16bOp
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
-from tile_scheduler import CTATileOrdering, TileScheduler, TileSchedulerArgs, RasterOrder, PersistenceMode
-from cta_swizzle import get_swizzle_block
-from smem_utils import make_smem_layout, make_epi_smem_layout
-from utils import NamedBarrier, make_pipeline_state, tma_get_copy_fn
+from gemm.tile_scheduler import CTATileOrdering, TileScheduler, TileSchedulerArgs, RasterOrder, PersistenceMode
+from gemm.cta_swizzle import get_swizzle_block
+from gemm.smem_utils import make_smem_layout, make_epi_smem_layout
+from gemm.utils import NamedBarrier, make_pipeline_state, tma_get_copy_fn
 
 '''
 adding pingpong mma and epi warps and consumer and producer try/wait in mma and load warps
@@ -35,7 +35,9 @@ class GemmSm90_v8:
         cta_swizzle_width: int = 8,
         k_depth: int = 4,
         k_pipe_mmas: int = 1,
+        use_pdl: bool = False,
     ):
+        self.use_pdl = use_pdl
         self.k_depth = k_depth
         self.k_pipe_mmas = k_pipe_mmas
         self.tile_ordering = tile_ordering
@@ -192,6 +194,7 @@ class GemmSm90_v8:
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape_mnk,
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -270,6 +273,8 @@ class GemmSm90_v8:
                 )
                 a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
                 b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_wait()
                 while work_tile.is_valid_tile:
                     bidx, bidy, _, _ = work_tile.tile_idx
                 
@@ -472,6 +477,9 @@ class GemmSm90_v8:
                     tma_consumer_state.advance_iters(k_tile_cnt)
                     tile_scheduler.advance_to_next_work(advance_count=self.mma_warpgroups)
                     work_tile = tile_scheduler.get_current_work()
+            
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
             
             if const_expr(not self.pingpong):
                 if is_tma_warp:

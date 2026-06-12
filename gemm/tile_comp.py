@@ -8,7 +8,7 @@ Problem sizes default to M=4096, N=128, K=8192.
 """
 
 from tile_scheduler import CTATileOrdering, PersistenceMode
-from run import run
+from gemm.run import run
 
 # Problem dimensions (fixed across sweep)
 M_PROBLEM = N_PROBLEM = K_PROBLEM = 8192

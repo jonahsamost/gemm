@@ -6,8 +6,8 @@ import cutlass
 from cutlass import Int32, const_expr, Boolean
 
 
-from divmod import FastDivmod
-from utils import PipelineStateWAdvance, atomic_inc_i32, store_shared_remote_x4
+from gemm.divmod import FastDivmod
+from gemm.utils import PipelineStateWAdvance, atomic_inc_i32, store_shared_remote_x4
 
 
 class RasterOrder(IntEnum):
